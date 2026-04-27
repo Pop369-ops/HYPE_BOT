@@ -1,22 +1,16 @@
 """
 ╔═══════════════════════════════════════════════════════════════════╗
-║                       HYPE_BOT v2.0                              ║
-║       كاشف الهايب — Whale-Style Multi-Source Scanner             ║
+║                       HYPE_BOT v3.0                              ║
+║       كاشف الهايب — Wintermute-Style Multi-Source Scanner       ║
 ║                                                                   ║
-║  5 مصادر مدمجة بأوزان احترافية ديناميكية:                       ║
-║    💧 DexScreener  — 40% (50% بدون LC)  on-chain volume         ║
-║    🦙 DefiLlama    — 20% (25% بدون LC)  TVL change              ║
-║    🌌 LunarCrush   — 20% (اختياري)       Galaxy Score           ║
-║    🐋 Binance Fut. — 12% (15% بدون LC)  OI + price action       ║
-║    📊 CoinPaprika  —  8% (10% بدون LC)  top gainers             ║
+║  5 مصادر بأوزان احترافية ديناميكية (chain-aware):               ║
+║    💧 DexScreener    35%  on-chain DEX volume                   ║
+║    🦙 DefiLlama      20%  TVL change (institutional)            ║
+║    🔍 Etherscan V2   20%  on-chain whale activity (إذا EVM)     ║
+║    🐋 Binance Fut.   15%  OI + futures action                   ║
+║    📊 CoinPaprika    10%  retail trending confirmation          ║
 ║                                                                   ║
-║  4 أوضاع كشف بمنطق الحيتان (high-conviction only):              ║
-║    🟢 هايب          ≥65  filter retail noise                    ║
-║    ⚖️ هايب متوازن    ≥75  whale watchlist                       ║
-║    💎 هايب جودة      ≥85  whale entry zone                      ║
-║    👑 هايب ذهبي      ≥92  sniper signals                        ║
-║                                                                   ║
-║  100% مجاني (LunarCrush اختياري)                                 ║
+║  100% on-chain heavy: 75% من الوزن on-chain                     ║
 ║  للأغراض التعليمية فقط — ليس نصيحة مالية                        ║
 ╚═══════════════════════════════════════════════════════════════════╝
 """
@@ -26,14 +20,13 @@ import time
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
-from collections import defaultdict
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
+    filters, ContextTypes
 )
 
 
@@ -48,42 +41,62 @@ logging.basicConfig(
 )
 log = logging.getLogger("HYPE_BOT")
 
-# ── API Keys (only BOT_TOKEN required, LunarCrush optional) ──
-BOT_TOKEN        = os.environ.get("BOT_TOKEN", "").strip()
-LUNARCRUSH_KEY   = os.environ.get("LUNARCRUSH_KEY", "").strip()
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "").strip()
+ETHERSCAN_KEY  = os.environ.get("ETHERSCAN_KEY", "").strip()
 
-# ── Endpoints (all free, no auth needed except LC) ──
-DS_BASE   = "https://api.dexscreener.com"
-LLAMA_BASE = "https://api.llama.fi"
-BIN_FAPI  = "https://fapi.binance.com/fapi/v1"
-CP_BASE   = "https://api.coinpaprika.com/v1"
-LC_BASE   = "https://lunarcrush.com/api4/public"
+DS_BASE         = "https://api.dexscreener.com"
+LLAMA_BASE      = "https://api.llama.fi"
+BIN_FAPI        = "https://fapi.binance.com/fapi/v1"
+CP_BASE         = "https://api.coinpaprika.com/v1"
+ETHERSCAN_BASE  = "https://api.etherscan.io/v2/api"
 
-# ── Source Weights (dynamic, computed at runtime) ──
-# Base weights when LunarCrush IS available (5-source mode):
-W_5SRC = {
-    "dexscreener": 0.40,
-    "defillama":   0.20,
-    "lunarcrush":  0.20,
-    "binance":     0.12,
-    "coinpaprika": 0.08,
+CHAIN_ID_MAP = {
+    "ethereum":  1,    "eth":       1,    "mainnet":   1,
+    "bsc":       56,   "binance":   56,   "bnb":       56,
+    "polygon":   137,  "matic":     137,
+    "arbitrum":  42161, "arb":      42161, "arbitrum-one": 42161,
+    "optimism":  10,   "op":        10,
+    "base":      8453,
+    "avalanche": 43114, "avax":     43114,
+    "fantom":    250,  "ftm":       250,
+    "linea":     59144,
+    "blast":     81457,
 }
 
-# Fallback weights when LunarCrush IS NOT available (4-source mode):
-W_4SRC = {
-    "dexscreener": 0.50,
-    "defillama":   0.25,
-    "lunarcrush":  0.00,    # disabled
+def is_evm_chain(chain: str) -> bool:
+    if not chain:
+        return False
+    return chain.lower().strip() in CHAIN_ID_MAP
+
+def get_chain_id(chain: str) -> int:
+    return CHAIN_ID_MAP.get((chain or "").lower().strip(), 0)
+
+
+W_5SRC = {
+    "dexscreener": 0.35,
+    "defillama":   0.20,
+    "etherscan":   0.20,
     "binance":     0.15,
     "coinpaprika": 0.10,
 }
 
-def get_weights() -> Dict[str, float]:
-    """Return active weights based on LC key availability."""
-    return W_5SRC if LUNARCRUSH_KEY else W_4SRC
+W_4SRC = {
+    "dexscreener": 0.45,
+    "defillama":   0.25,
+    "etherscan":   0.00,
+    "binance":     0.18,
+    "coinpaprika": 0.12,
+}
 
 
-# ── Mode Thresholds (whale-style, conviction-based) ──
+def get_weights_for_chain(chain: str) -> Dict[str, float]:
+    if not ETHERSCAN_KEY:
+        return W_4SRC
+    if is_evm_chain(chain):
+        return W_5SRC
+    return W_4SRC
+
+
 MODES = {
     "عادي":    {"min": 65, "min_sources": 2, "label": "🟢 عادي",   "min_per_source": 0},
     "متوازن":  {"min": 75, "min_sources": 3, "label": "⚖️ متوازن", "min_per_source": 50},
@@ -91,14 +104,17 @@ MODES = {
     "ذهبي":    {"min": 92, "min_sources": 4, "label": "👑 ذهبي",   "min_per_source": 70},
 }
 
-# ── Operational Constants ──
-SCAN_INTERVAL_SEC = 300                  # full scan cycle every 5 minutes
-COOLDOWN_HOURS    = 1                    # 1 hour per coin (user pref)
+SCAN_INTERVAL_SEC = 300
+COOLDOWN_HOURS    = 1
 MAX_RESULTS_KEPT  = 50
-MIN_LIQUIDITY_USD = 100_000              # DEX rug filter
-MIN_BINANCE_VOL   = 500_000              # min 24h quote volume
+MIN_LIQUIDITY_USD = 100_000
+MIN_BINANCE_VOL   = 500_000
 
-# ── Blacklist (stablecoins + wrapped + obvious junk) ──
+ES_TX_OFFSET     = 1000
+ES_WHALE_USD     = 10_000
+ES_REQUEST_DELAY = 0.25
+ES_MAX_TOKENS    = 15
+
 BLACKLIST = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDD", "USDP",
     "WBTC", "WETH", "STETH", "WSTETH", "WBNB", "WMATIC", "USDE",
@@ -106,33 +122,25 @@ BLACKLIST = {
     "USD0", "USDX", "EURS", "EURT",
 }
 
-# ── Timezone ──
 TZ_RIYADH = timezone(timedelta(hours=3))
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. GLOBAL STATE
+# 2. STATE
 # ══════════════════════════════════════════════════════════════════
 
-# {chat_id: {"active": bool, "mode": str, "min_score": int}}
 chat_config: Dict[int, Dict[str, Any]] = {}
-
-# {symbol: timestamp_iso} — cooldown tracker
 seen_coins: Dict[str, str] = {}
-
-# Last scan results
 last_results: List[Dict[str, Any]] = []
 
-# Source health status (5 sources now)
 source_status: Dict[str, Dict[str, Any]] = {
     "dexscreener": {"ok": False, "last_check": None, "error": None, "count": 0},
     "defillama":   {"ok": False, "last_check": None, "error": None, "count": 0},
-    "lunarcrush":  {"ok": False, "last_check": None, "error": None, "count": 0},
+    "etherscan":   {"ok": False, "last_check": None, "error": None, "count": 0},
     "binance":     {"ok": False, "last_check": None, "error": None, "count": 0},
     "coinpaprika": {"ok": False, "last_check": None, "error": None, "count": 0},
 }
 
-# Alert history (last 100)
 alert_history: List[Dict[str, Any]] = []
 
 
@@ -142,7 +150,7 @@ alert_history: List[Dict[str, Any]] = []
 
 _session = requests.Session()
 _session.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; HypeBot/2.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; HypeBot/3.0)",
     "Accept": "application/json",
 })
 
@@ -151,7 +159,6 @@ def safe_get(url: str, params: Optional[dict] = None,
              headers: Optional[dict] = None,
              timeout: tuple = (5, 20),
              retries: int = 2) -> Optional[Any]:
-    """طلب آمن مع إعادة المحاولة وحماية من rate limits."""
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -168,7 +175,7 @@ def safe_get(url: str, params: Optional[dict] = None,
                 last_err = "429 rate limit"
                 time.sleep(2 ** attempt)
                 continue
-            elif r.status_code in (401, 403):
+            elif r.status_code in (401, 402, 403):
                 return {"_auth_error": r.status_code,
                         "_text": r.text[:200] if r.text else "no body"}
             else:
@@ -187,12 +194,7 @@ def now_iso() -> str:
     return datetime.now(TZ_RIYADH).isoformat()
 
 
-def now_str() -> str:
-    return datetime.now(TZ_RIYADH).strftime("%H:%M:%S")
-
-
 def normalize_sym(s: str) -> str:
-    """Strip USDT/BUSD suffix and uppercase."""
     s = (s or "").upper().strip()
     for suffix in ("USDT", "BUSD", "USDC", "USD"):
         if s.endswith(suffix) and len(s) > len(suffix):
@@ -201,15 +203,13 @@ def normalize_sym(s: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 4. SOURCE FETCHERS (5 sources, all returning {SYM_UPPER: data_dict})
+# 4. SOURCE FETCHERS (5 sources)
 # ══════════════════════════════════════════════════════════════════
 
-# ── ① DexScreener: Boosted tokens + volume surge ──
+# ── ① DexScreener (must run FIRST — provides token addresses for Etherscan) ──
 def fetch_dexscreener_data() -> Dict[str, Dict]:
     """
-    1) GET top boosted tokens (proxy for paid attention)
-    2) For each, fetch full pair data with volumes/liquidity/price-change
-    Returns: {symbol_upper: {volume metrics, liquidity, price_change, ...}}
+    Returns: {symbol_upper: {volume metrics, liquidity, base_token_address, chain, ...}}
     """
     boosts = safe_get(f"{DS_BASE}/token-boosts/top/v1")
     if not boosts or "_auth_error" in (boosts or {}):
@@ -236,19 +236,19 @@ def fetch_dexscreener_data() -> Dict[str, Dict]:
         if not pairs:
             continue
 
-        # Pick highest-liquidity pair
         best = max(pairs, key=lambda p: float(
             (p.get("liquidity") or {}).get("usd") or 0
         ))
 
         base_token = best.get("baseToken", {}) or {}
         sym = (base_token.get("symbol") or "").upper()
-        if not sym or sym in BLACKLIST:
+        base_addr = (base_token.get("address") or "").lower()
+        if not sym or sym in BLACKLIST or not base_addr:
             continue
 
         liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
         if liquidity < MIN_LIQUIDITY_USD:
-            continue  # filter rugs
+            continue
 
         vol = best.get("volume", {}) or {}
         v_h1  = float(vol.get("h1") or 0)
@@ -278,10 +278,12 @@ def fetch_dexscreener_data() -> Dict[str, Dict]:
             "price_change_h1":   price_change_h1,
             "price_change_h24":  price_change_h24,
             "boost_amount":      boost_amount,
-            "chain":             chain,
+            "chain":             (chain or "").lower(),
             "pair_url":          best.get("url", ""),
             "age_days":          age_days,
             "pair_address":      best.get("pairAddress", ""),
+            "base_token_address": base_addr,    # ⭐ NEW for Etherscan
+            "is_evm":            is_evm_chain(chain),
         }
 
     source_status["dexscreener"] = {
@@ -291,13 +293,8 @@ def fetch_dexscreener_data() -> Dict[str, Dict]:
     return out
 
 
-# ── ② DefiLlama: TVL changes per protocol ──
+# ── ② DefiLlama: TVL changes ──
 def fetch_defillama_data() -> Dict[str, Dict]:
-    """
-    GET /protocols → all protocols with TVL + change_1h/1d/7d.
-    Aggregate by symbol (multi-protocol tokens like UNI sum across protocols).
-    Returns: {symbol_upper: {tvl, change_1d, change_7d, name, category, chains, ...}}
-    """
     data = safe_get(f"{LLAMA_BASE}/protocols")
     if not data or "_auth_error" in (data or {}):
         source_status["defillama"] = {
@@ -313,14 +310,13 @@ def fetch_defillama_data() -> Dict[str, Dict]:
         }
         return {}
 
-    # Aggregate by symbol — take the highest-TVL protocol per symbol
     by_sym: Dict[str, Dict] = {}
     for p in data:
         sym = (p.get("symbol") or "").upper()
         if not sym or sym == "-" or sym in BLACKLIST:
             continue
         tvl = float(p.get("tvl") or 0)
-        if tvl < 100_000:  # filter dust protocols
+        if tvl < 100_000:
             continue
 
         existing = by_sym.get(sym)
@@ -343,66 +339,179 @@ def fetch_defillama_data() -> Dict[str, Dict]:
     source_status["defillama"] = {
         "ok": True, "last_check": now_iso(), "error": None, "count": len(by_sym),
     }
-    log.info(f"[LLAMA] {len(by_sym)} protocols with TVL fetched")
+    log.info(f"[LLAMA] {len(by_sym)} protocols fetched")
     return by_sym
 
 
-# ── ③ LunarCrush: Galaxy Score (optional, with key) ──
-def fetch_lunarcrush_data() -> Dict[str, Dict]:
+# ── ③ Etherscan V2: on-chain whale activity ──
+def _es_compute_metrics(transfers: List[dict], price_usd: float) -> Dict[str, Any]:
+    """Compute hype metrics from token transfer list."""
+    if not transfers:
+        return {
+            "tx_count_1h": 0, "tx_count_24h": 0,
+            "velocity_ratio": 0, "unique_addrs_24h": 0,
+            "whale_tx_count_1h": 0, "whale_volume_usd_24h": 0,
+        }
+
+    now_ts = time.time()
+    txs_1h_count = 0
+    txs_24h_count = 0
+    unique_addrs = set()
+    whale_tx_1h = 0
+    whale_volume_24h = 0.0
+
+    for tx in transfers:
+        try:
+            ts = int(tx.get("timeStamp", 0))
+            age_sec = now_ts - ts
+            if age_sec > 86400:
+                continue
+
+            value_raw = float(tx.get("value", 0))
+            decimals = int(tx.get("tokenDecimal", 18))
+            if decimals < 0 or decimals > 36:
+                continue
+            value_tokens = value_raw / (10 ** decimals)
+            value_usd = value_tokens * price_usd if price_usd > 0 else 0
+
+            from_addr = (tx.get("from") or "").lower()
+            to_addr = (tx.get("to") or "").lower()
+            if from_addr:
+                unique_addrs.add(from_addr)
+            if to_addr:
+                unique_addrs.add(to_addr)
+
+            txs_24h_count += 1
+            if value_usd >= ES_WHALE_USD:
+                whale_volume_24h += value_usd
+            if age_sec < 3600:
+                txs_1h_count += 1
+                if value_usd >= ES_WHALE_USD:
+                    whale_tx_1h += 1
+        except (TypeError, ValueError):
+            continue
+
+    avg_per_hour = txs_24h_count / 24.0 if txs_24h_count else 0
+    velocity_ratio = (txs_1h_count / avg_per_hour) if avg_per_hour > 0 else 0
+
+    return {
+        "tx_count_1h":         txs_1h_count,
+        "tx_count_24h":        txs_24h_count,
+        "velocity_ratio":      round(velocity_ratio, 2),
+        "unique_addrs_24h":    len(unique_addrs),
+        "whale_tx_count_1h":   whale_tx_1h,
+        "whale_volume_usd_24h": round(whale_volume_24h, 2),
+    }
+
+
+def fetch_etherscan_data(ds_data: Dict[str, Dict]) -> Dict[str, Dict]:
     """
-    GET /coins/list/v2 → top 100 coins by Galaxy Score.
-    Returns: {symbol_upper: {galaxy_score, alt_rank, sentiment, ...}}
+    Use Etherscan V2 to fetch on-chain metrics for EVM tokens from DS data.
+    Sequential dependency: DS must run first.
     """
-    if not LUNARCRUSH_KEY:
-        source_status["lunarcrush"] = {
+    if not ETHERSCAN_KEY:
+        source_status["etherscan"] = {
             "ok": False, "last_check": now_iso(),
-            "error": "no API key (optional)", "count": 0,
+            "error": "no API key", "count": 0,
         }
         return {}
 
-    headers = {"Authorization": f"Bearer {LUNARCRUSH_KEY}"}
-    data = safe_get(f"{LC_BASE}/coins/list/v2",
-                    params={"limit": 100, "sort": "galaxy_score"},
-                    headers=headers)
+    # Filter for EVM tokens only
+    evm_tokens = []
+    for sym, info in ds_data.items():
+        if info.get("is_evm") and info.get("base_token_address"):
+            evm_tokens.append((
+                sym,
+                info["chain"],
+                info["base_token_address"],
+                info.get("price_usd", 0),
+            ))
 
-    if not data or "_auth_error" in (data or {}):
-        source_status["lunarcrush"] = {
-            "ok": False, "last_check": now_iso(),
-            "error": data.get("_text", "auth/unreachable")[:80] if data else "unreachable",
-            "count": 0,
+    if not evm_tokens:
+        source_status["etherscan"] = {
+            "ok": True, "last_check": now_iso(),
+            "error": "no EVM tokens in DS results", "count": 0,
         }
         return {}
+
+    # Limit to ES_MAX_TOKENS to avoid hitting rate limits
+    evm_tokens = evm_tokens[:ES_MAX_TOKENS]
 
     out = {}
-    items = data.get("data", []) if isinstance(data, dict) else []
-    for c in items:
-        sym = (c.get("symbol") or "").upper()
-        if not sym or sym in BLACKLIST:
+    auth_error_seen = False
+    for sym, chain, contract, price in evm_tokens:
+        chainid = get_chain_id(chain)
+        if not chainid:
             continue
-        out[sym] = {
-            "galaxy_score":      float(c.get("galaxy_score") or 0),
-            "alt_rank":          int(c.get("alt_rank") or 9999),
-            "social_volume_24h": float(c.get("interactions_24h") or 0),
-            "social_dominance":  float(c.get("social_dominance") or 0),
-            "sentiment":         float(c.get("sentiment") or 50),
-            "price":             float(c.get("price") or 0),
-            "percent_change_24h": float(c.get("percent_change_24h") or 0),
+
+        params = {
+            "chainid": chainid,
+            "module": "account",
+            "action": "tokentx",
+            "contractaddress": contract,
+            "page": 1,
+            "offset": ES_TX_OFFSET,
+            "sort": "desc",
+            "apikey": ETHERSCAN_KEY,
         }
 
-    source_status["lunarcrush"] = {
-        "ok": True, "last_check": now_iso(), "error": None, "count": len(out),
-    }
-    log.info(f"[LC] {len(out)} coins with Galaxy Score fetched")
+        data = safe_get(ETHERSCAN_BASE, params=params, timeout=(5, 25), retries=1)
+
+        if not data:
+            log.warning(f"[ES] {sym} ({chain}) → no response")
+            time.sleep(ES_REQUEST_DELAY)
+            continue
+
+        if isinstance(data, dict) and "_auth_error" in data:
+            auth_error_seen = True
+            log.warning(f"[ES] auth error: {data.get('_auth_error')}")
+            break
+
+        if not isinstance(data, dict):
+            time.sleep(ES_REQUEST_DELAY)
+            continue
+
+        if data.get("status") == "0":
+            # "No transactions found" or other non-error empty result
+            msg = (data.get("message") or "").lower()
+            if "no transactions" in msg or "no records" in msg:
+                pass  # not an error, just empty
+            time.sleep(ES_REQUEST_DELAY)
+            continue
+
+        transfers = data.get("result") or []
+        if not isinstance(transfers, list):
+            time.sleep(ES_REQUEST_DELAY)
+            continue
+
+        metrics = _es_compute_metrics(transfers, price)
+        if metrics["tx_count_24h"] > 0:
+            out[sym] = {
+                "chain":   chain,
+                "chainid": chainid,
+                "contract": contract,
+                **metrics,
+            }
+
+        time.sleep(ES_REQUEST_DELAY)  # rate-limit-friendly
+
+    if auth_error_seen and not out:
+        source_status["etherscan"] = {
+            "ok": False, "last_check": now_iso(),
+            "error": "auth error (check ETHERSCAN_KEY)", "count": 0,
+        }
+    else:
+        source_status["etherscan"] = {
+            "ok": True, "last_check": now_iso(),
+            "error": None, "count": len(out),
+        }
+
+    log.info(f"[ES] {len(out)}/{len(evm_tokens)} EVM tokens analyzed")
     return out
 
 
-# ── ④ Binance Futures: 24h ticker (price, volume, OI signal) ──
+# ── ④ Binance Futures ──
 def fetch_binance_data() -> Dict[str, Dict]:
-    """
-    GET /fapi/v1/ticker/24hr → all USDT-perp tickers.
-    Computes per-symbol: price_change %, volume rank, volume vs market median.
-    Returns: {symbol_upper: {price_change_pct, quote_volume, volume_rank, ...}}
-    """
     data = safe_get(f"{BIN_FAPI}/ticker/24hr", timeout=(5, 25))
     if not data or "_auth_error" in (data or {}):
         source_status["binance"] = {
@@ -418,7 +527,6 @@ def fetch_binance_data() -> Dict[str, Dict]:
         }
         return {}
 
-    # Filter USDT pairs only
     usdt_pairs = []
     for t in data:
         sym_full = t.get("symbol", "")
@@ -443,7 +551,6 @@ def fetch_binance_data() -> Dict[str, Dict]:
             "trades":      int(t.get("count") or 0),
         })
 
-    # Sort by volume to compute rank
     usdt_pairs.sort(key=lambda x: x["quote_vol"], reverse=True)
     total = len(usdt_pairs)
 
@@ -453,15 +560,15 @@ def fetch_binance_data() -> Dict[str, Dict]:
         if not sym or sym in BLACKLIST:
             continue
         out[sym] = {
-            "symbol_full":  p["symbol_full"],
+            "symbol_full":      p["symbol_full"],
             "price_change_pct": p["price_chg"],
-            "quote_volume": p["quote_vol"],
-            "last_price":   p["last_price"],
-            "high":         p["high"],
-            "low":          p["low"],
-            "trades":       p["trades"],
-            "volume_rank":  rank,
-            "total_pairs":  total,
+            "quote_volume":     p["quote_vol"],
+            "last_price":       p["last_price"],
+            "high":             p["high"],
+            "low":              p["low"],
+            "trades":           p["trades"],
+            "volume_rank":      rank,
+            "total_pairs":      total,
         }
 
     source_status["binance"] = {
@@ -471,13 +578,8 @@ def fetch_binance_data() -> Dict[str, Dict]:
     return out
 
 
-# ── ⑤ CoinPaprika: Top gainers + global market data ──
+# ── ⑤ CoinPaprika ──
 def fetch_coinpaprika_data() -> Dict[str, Dict]:
-    """
-    GET /tickers → top 2000 coins by mcap with 24h % change.
-    Sort to identify top gainers.
-    Returns: {symbol_upper: {price, percent_change_24h, gainer_rank, mc_rank, ...}}
-    """
     data = safe_get(f"{CP_BASE}/tickers", params={"limit": 2000},
                     timeout=(5, 25))
     if not data or "_auth_error" in (data or {}):
@@ -494,7 +596,6 @@ def fetch_coinpaprika_data() -> Dict[str, Dict]:
         }
         return {}
 
-    # Extract relevant fields
     coins = []
     for c in data:
         sym = (c.get("symbol") or "").upper()
@@ -508,7 +609,7 @@ def fetch_coinpaprika_data() -> Dict[str, Dict]:
             vol_24h = float(usd.get("volume_24h") or 0)
         except (TypeError, ValueError):
             continue
-        if mc < 1_000_000:  # dust filter
+        if mc < 1_000_000:
             continue
         coins.append({
             "id":       c.get("id", ""),
@@ -521,38 +622,34 @@ def fetch_coinpaprika_data() -> Dict[str, Dict]:
             "volume":   vol_24h,
         })
 
-    # Sort by 24h % change (descending) for gainer rank
     sorted_by_gain = sorted(coins, key=lambda x: x["pct_24h"], reverse=True)
     gainer_rank_map = {c["symbol"]: idx + 1 for idx, c in enumerate(sorted_by_gain)}
 
     out = {}
     for c in coins:
         out[c["symbol"]] = {
-            "id":            c["id"],
-            "name":          c["name"],
-            "price":         c["price"],
-            "percent_24h":   c["pct_24h"],
-            "mcap":          c["mcap"],
-            "volume_24h":    c["volume"],
-            "mc_rank":       c["rank"],
-            "gainer_rank":   gainer_rank_map.get(c["symbol"], 9999),
+            "id":          c["id"],
+            "name":        c["name"],
+            "price":       c["price"],
+            "percent_24h": c["pct_24h"],
+            "mcap":        c["mcap"],
+            "volume_24h":  c["volume"],
+            "mc_rank":     c["rank"],
+            "gainer_rank": gainer_rank_map.get(c["symbol"], 9999),
         }
 
     source_status["coinpaprika"] = {
         "ok": True, "last_check": now_iso(), "error": None, "count": len(out),
     }
-    log.info(f"[CP] {len(out)} coins fetched (sorted by gain)")
+    log.info(f"[CP] {len(out)} coins fetched")
     return out
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. SOURCE SCORERS (each → 0..100 raw)
+# 5. SOURCE SCORERS (each → 0..100)
 # ══════════════════════════════════════════════════════════════════
 
 def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
-    """
-    Whale signal: on-chain volume surge + liquidity quality + price-vol agreement.
-    """
     info = ds_data.get(sym)
     if not info:
         return 0.0
@@ -564,7 +661,6 @@ def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
     boost      = info.get("boost_amount", 0)
     age_days   = info.get("age_days", 0)
 
-    # Base: volume surge
     if vol_change <= 0:
         base = 20.0
     elif vol_change < 50:
@@ -580,7 +676,6 @@ def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
     else:
         base = 95.0
 
-    # Liquidity tier
     if liquidity >= 5_000_000:
         base += 3.0
     elif liquidity >= 1_000_000:
@@ -588,7 +683,6 @@ def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
     elif liquidity < 250_000:
         base -= 5.0
 
-    # Price-volume agreement
     if vol_change > 100 and price_h1 > 5:
         base += 5.0
     elif vol_change > 100 and price_h1 < -5:
@@ -597,13 +691,11 @@ def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
     if price_h24 > 20:
         base += 2.0
 
-    # Boost amount
     if boost >= 500:
         base += 3.0
     elif boost >= 100:
         base += 1.5
 
-    # Age penalty (rug risk)
     if age_days < 7:
         base -= 8.0
     elif age_days < 30:
@@ -613,20 +705,14 @@ def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
 
 
 def score_defillama(sym: str, llama_data: Dict[str, Dict]) -> float:
-    """
-    TVL change is the strongest institutional whale signal.
-    Whales position via DeFi protocols — TVL inflow precedes price.
-    """
     info = llama_data.get(sym)
     if not info:
         return 0.0
 
-    tvl       = info.get("tvl", 0)
-    chg_1d    = info.get("change_1d", 0)
-    chg_7d    = info.get("change_7d", 0)
-    mcap      = info.get("mcap", 0)
+    tvl    = info.get("tvl", 0)
+    chg_1d = info.get("change_1d", 0)
+    chg_7d = info.get("change_7d", 0)
 
-    # Base: TVL change 1d
     if chg_1d > 50:
         base = 95.0
     elif chg_1d > 25:
@@ -644,7 +730,6 @@ def score_defillama(sym: str, llama_data: Dict[str, Dict]) -> float:
     else:
         base = 10.0
 
-    # 7d trend confirmation
     if chg_7d > 30:
         base += 5.0
     elif chg_7d > 15:
@@ -652,53 +737,79 @@ def score_defillama(sym: str, llama_data: Dict[str, Dict]) -> float:
     elif chg_7d < -20:
         base -= 5.0
 
-    # TVL tier (size matters for quality)
-    if tvl >= 1_000_000_000:    # >$1B
+    if tvl >= 1_000_000_000:
         base += 5.0
-    elif tvl >= 100_000_000:    # >$100M
+    elif tvl >= 100_000_000:
         base += 3.0
-    elif tvl >= 10_000_000:     # >$10M
+    elif tvl >= 10_000_000:
         base += 1.0
-    elif tvl < 1_000_000:       # <$1M = risky
+    elif tvl < 1_000_000:
         base -= 5.0
 
     return max(0.0, min(100.0, base))
 
 
-def score_lunarcrush(sym: str, lc_data: Dict[str, Dict]) -> float:
-    """Galaxy Score is a direct quality signal (when LC available)."""
-    info = lc_data.get(sym)
+def score_etherscan(sym: str, es_data: Dict[str, Dict]) -> float:
+    """
+    Score based on on-chain whale activity:
+    - velocity_ratio (1h vs 24h average) → main signal
+    - whale_tx_count (transfers ≥$10K)
+    - unique_addrs_24h (diversity)
+    """
+    info = es_data.get(sym)
     if not info:
         return 0.0
 
-    galaxy = info.get("galaxy_score", 0)
-    sentiment = info.get("sentiment", 50)
-    social_dom = info.get("social_dominance", 0)
-    alt_rank = info.get("alt_rank", 9999)
+    velocity     = info.get("velocity_ratio", 0)
+    unique_addrs = info.get("unique_addrs_24h", 0)
+    whale_count  = info.get("whale_tx_count_1h", 0)
+    whale_vol    = info.get("whale_volume_usd_24h", 0)
+    tx_24h       = info.get("tx_count_24h", 0)
 
-    score = galaxy
+    # Base: velocity ratio (1h tx count / 24h hourly average)
+    if velocity >= 5.0:
+        base = 95.0           # 5x normal = explosion
+    elif velocity >= 3.0:
+        base = 85.0
+    elif velocity >= 2.0:
+        base = 75.0
+    elif velocity >= 1.5:
+        base = 65.0
+    elif velocity >= 1.0:
+        base = 50.0
+    elif velocity >= 0.5:
+        base = 35.0
+    else:
+        base = 20.0
 
-    if sentiment > 60:
-        score += min(5.0, (sentiment - 60) / 8.0)
-    elif sentiment < 40:
-        score -= min(5.0, (40 - sentiment) / 8.0)
+    # Whale tx bonus (last 1h)
+    if whale_count >= 5:
+        base += 8.0
+    elif whale_count >= 2:
+        base += 5.0
+    elif whale_count >= 1:
+        base += 2.0
 
-    if social_dom > 1.0:
-        score += min(5.0, social_dom * 2.0)
+    # Unique address diversity (organic interest indicator)
+    if unique_addrs >= 200:
+        base += 5.0
+    elif unique_addrs >= 100:
+        base += 3.0
+    elif unique_addrs < 20:
+        base -= 5.0  # too few = manipulated
 
-    if alt_rank <= 50:
-        score += 5.0
-    elif alt_rank <= 100:
-        score += 2.0
+    # Whale volume bonus
+    if whale_vol >= 1_000_000:
+        base += 3.0
 
-    return max(0.0, min(100.0, score))
+    # Activity floor: very low tx_24h = dead token
+    if tx_24h < 10:
+        base = min(base, 30.0)
+
+    return max(0.0, min(100.0, base))
 
 
 def score_binance(sym: str, bin_data: Dict[str, Dict]) -> float:
-    """
-    Binance Futures whale positioning: 24h price % + volume rank.
-    High volume + strong move = institutional flow.
-    """
     info = bin_data.get(sym)
     if not info:
         return 0.0
@@ -708,7 +819,6 @@ def score_binance(sym: str, bin_data: Dict[str, Dict]) -> float:
     vol_rank  = info.get("volume_rank", 9999)
     total     = info.get("total_pairs", 1)
 
-    # Base: 24h % change (absolute value matters — both pumps and dumps are signals)
     abs_chg = abs(price_chg)
     if abs_chg > 40:
         base = 95.0
@@ -723,7 +833,6 @@ def score_binance(sym: str, bin_data: Dict[str, Dict]) -> float:
     else:
         base = 20.0
 
-    # Volume rank tier (top 10% of pairs = whale interest)
     rank_pct = (vol_rank / total * 100) if total > 0 else 100
     if rank_pct <= 5:
         base += 8.0
@@ -734,24 +843,18 @@ def score_binance(sym: str, bin_data: Dict[str, Dict]) -> float:
     elif rank_pct > 75:
         base -= 5.0
 
-    # Direction signal (positive change preferred for hype)
     if price_chg > 0:
         base += 2.0
 
-    # Massive volume boost
-    if qvol >= 500_000_000:    # >$500M = top tier
+    if qvol >= 500_000_000:
         base += 5.0
-    elif qvol >= 100_000_000:  # >$100M
+    elif qvol >= 100_000_000:
         base += 3.0
 
     return max(0.0, min(100.0, base))
 
 
 def score_coinpaprika(sym: str, cp_data: Dict[str, Dict]) -> float:
-    """
-    CoinPaprika gainer rank: where does this coin sit in 24h gainers?
-    Top-N gainers = retail attention building.
-    """
     info = cp_data.get(sym)
     if not info:
         return 0.0
@@ -759,9 +862,7 @@ def score_coinpaprika(sym: str, cp_data: Dict[str, Dict]) -> float:
     pct_24h     = info.get("percent_24h", 0)
     gainer_rank = info.get("gainer_rank", 9999)
     mc_rank     = info.get("mc_rank", 9999)
-    mcap        = info.get("mcap", 0)
 
-    # Base: gainer rank
     if gainer_rank <= 5:
         base = 95.0
     elif gainer_rank <= 10:
@@ -777,13 +878,11 @@ def score_coinpaprika(sym: str, cp_data: Dict[str, Dict]) -> float:
     else:
         base = 10.0
 
-    # % change confirmation
     if pct_24h < 2:
-        base *= 0.5  # gainer rank but tiny move = dead
+        base *= 0.5
     elif pct_24h > 30:
         base += 5.0
 
-    # MC tier
     if mc_rank <= 50:
         base += 3.0
     elif mc_rank > 1000:
@@ -793,26 +892,22 @@ def score_coinpaprika(sym: str, cp_data: Dict[str, Dict]) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6. AGGREGATOR (with dynamic weights)
+# 6. AGGREGATOR (chain-aware dynamic weights)
 # ══════════════════════════════════════════════════════════════════
 
 def aggregate_hype_signals(
     ds_data: Dict[str, Dict],
     llama_data: Dict[str, Dict],
-    lc_data: Dict[str, Dict],
+    es_data: Dict[str, Dict],
     bin_data: Dict[str, Dict],
     cp_data: Dict[str, Dict],
 ) -> List[Dict[str, Any]]:
-    """
-    Combine 5 sources with dynamic weights → ranked list.
-    """
-    weights = get_weights()
+    """Combine 5 sources with chain-aware weights → ranked list."""
 
-    # All unique symbols
     all_syms = set()
     all_syms.update(ds_data.keys())
     all_syms.update(llama_data.keys())
-    all_syms.update(lc_data.keys())
+    all_syms.update(es_data.keys())
     all_syms.update(bin_data.keys())
     all_syms.update(cp_data.keys())
 
@@ -820,19 +915,24 @@ def aggregate_hype_signals(
     for sym in all_syms:
         s_ds    = score_dexscreener(sym, ds_data)
         s_llama = score_defillama(sym, llama_data)
-        s_lc    = score_lunarcrush(sym, lc_data)
+        s_es    = score_etherscan(sym, es_data)
         s_bin   = score_binance(sym, bin_data)
         s_cp    = score_coinpaprika(sym, cp_data)
 
-        # Count meaningful sources (≥30 pts)
-        all_scores = [s_ds, s_llama, s_lc, s_bin, s_cp]
+        # Determine chain context for weight selection
+        ds_info = ds_data.get(sym, {})
+        chain = ds_info.get("chain", "")
+        is_evm = ds_info.get("is_evm", False)
+
+        weights = get_weights_for_chain(chain)
+
+        all_scores = [s_ds, s_llama, s_es, s_bin, s_cp]
         sources_count = sum(1 for s in all_scores if s >= 30)
 
-        # Weighted unified score
         unified = (
             s_ds    * weights["dexscreener"] +
             s_llama * weights["defillama"] +
-            s_lc    * weights["lunarcrush"] +
+            s_es    * weights["etherscan"] +
             s_bin   * weights["binance"] +
             s_cp    * weights["coinpaprika"]
         )
@@ -844,16 +944,19 @@ def aggregate_hype_signals(
             "symbol":         sym,
             "score":          round(unified, 1),
             "sources_count":  sources_count,
+            "is_evm":         is_evm,
+            "chain":          chain,
+            "weights_used":   weights,
             "breakdown": {
                 "dexscreener": round(s_ds, 1),
                 "defillama":   round(s_llama, 1),
-                "lunarcrush":  round(s_lc, 1),
+                "etherscan":   round(s_es, 1),
                 "binance":     round(s_bin, 1),
                 "coinpaprika": round(s_cp, 1),
             },
             "ds_info":    ds_data.get(sym, {}),
             "llama_info": llama_data.get(sym, {}),
-            "lc_info":    lc_data.get(sym, {}),
+            "es_info":    es_data.get(sym, {}),
             "bin_info":   bin_data.get(sym, {}),
             "cp_info":    cp_data.get(sym, {}),
         })
@@ -866,14 +969,18 @@ def aggregate_hype_signals(
 # 7. FILTERS
 # ══════════════════════════════════════════════════════════════════
 
-def passes_mode_filter(item: Dict[str, Any], mode: str) -> tuple:
+def passes_mode_filter(item: Dict[str, Any], mode: str) -> Tuple[bool, str]:
     cfg = MODES.get(mode, MODES["عادي"])
 
     if item["score"] < cfg["min"]:
         return False, f"score {item['score']} < {cfg['min']}"
 
-    if item["sources_count"] < cfg["min_sources"]:
-        return False, f"sources {item['sources_count']}/{cfg['min_sources']}"
+    # For non-EVM tokens, max sources is 4 (Etherscan unavailable)
+    max_possible_sources = 5 if item.get("is_evm") and ETHERSCAN_KEY else 4
+    required_sources = min(cfg["min_sources"], max_possible_sources)
+
+    if item["sources_count"] < required_sources:
+        return False, f"sources {item['sources_count']}/{required_sources}"
 
     if cfg["min_per_source"] > 0:
         active_scores = [v for v in item["breakdown"].values() if v >= 30]
@@ -919,27 +1026,48 @@ def _src_emoji(score: float) -> str:
     return "⚪"
 
 
+def _explorer_url(chain: str, address: str) -> str:
+    """Get block explorer URL for chain."""
+    explorers = {
+        "ethereum":  "https://etherscan.io/token/",
+        "bsc":       "https://bscscan.com/token/",
+        "polygon":   "https://polygonscan.com/token/",
+        "arbitrum":  "https://arbiscan.io/token/",
+        "optimism":  "https://optimistic.etherscan.io/token/",
+        "base":      "https://basescan.org/token/",
+        "avalanche": "https://snowtrace.io/token/",
+        "fantom":    "https://ftmscan.com/token/",
+        "linea":     "https://lineascan.build/token/",
+        "blast":     "https://blastscan.io/token/",
+    }
+    base = explorers.get((chain or "").lower(), "https://etherscan.io/token/")
+    return f"{base}{address}"
+
+
 def format_alert(item: Dict[str, Any], mode: str) -> str:
-    """Build Arabic alert in Markdown."""
     sym       = item["symbol"]
     score     = item["score"]
     sources   = item["sources_count"]
+    is_evm    = item["is_evm"]
+    chain     = item["chain"]
     bk        = item["breakdown"]
+    weights   = item["weights_used"]
     ds        = item["ds_info"]
     llama     = item["llama_info"]
-    lc        = item["lc_info"]
+    es        = item["es_info"]
     bin_i     = item["bin_info"]
     cp        = item["cp_info"]
 
-    weights = get_weights()
     grade = _grade_label(score)
-    has_lc = bool(LUNARCRUSH_KEY)
 
     lines = []
     lines.append(f"🔥 *إشارة HYPE* — `{sym}`")
+    if chain:
+        lines.append(f"⛓ Chain: `{chain}` {'(EVM ✅)' if is_evm else '(non-EVM)'}")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"🎯 السكور الموحّد: *{score}/100* {grade}")
-    total_sources = 5 if has_lc else 4
+
+    total_sources = 5 if (is_evm and ETHERSCAN_KEY) else 4
     lines.append(f"📊 المصادر المتفقة: *{sources}/{total_sources}*")
     lines.append("")
 
@@ -955,10 +1083,9 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
             vc = ds.get("vol_change_pct", 0)
             liq = ds.get("liquidity_usd", 0)
             ph1 = ds.get("price_change_h1", 0)
-            chain = ds.get("chain", "?")
             lines.append(
                 f"   💧 Vol +{vc:.0f}% | Liq ${liq/1000:.0f}K | "
-                f"H1: {ph1:+.1f}% | {chain}"
+                f"H1: {ph1:+.1f}%"
             )
 
     # ② DefiLlama
@@ -977,19 +1104,25 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
                 f"   🦙 TVL: {tvl_s} | 1d: {c1d:+.1f}% | 7d: {c7d:+.1f}% | {cat}"
             )
 
-    # ③ LunarCrush (only if available)
-    if has_lc and bk["lunarcrush"] > 0:
-        w_pct = int(weights["lunarcrush"] * 100)
+    # ③ Etherscan (only for EVM tokens with key)
+    if is_evm and ETHERSCAN_KEY and bk["etherscan"] > 0:
+        w_pct = int(weights["etherscan"] * 100)
         lines.append(
-            f"{_src_emoji(bk['lunarcrush'])} LunarCrush: `{bk['lunarcrush']}/100` (وزن {w_pct}%)"
+            f"{_src_emoji(bk['etherscan'])} Etherscan: `{bk['etherscan']}/100` (وزن {w_pct}%)"
         )
-        if lc:
-            galaxy = lc.get("galaxy_score", 0)
-            altrnk = lc.get("alt_rank", 0)
-            sent = lc.get("sentiment", 0)
+        if es:
+            vel = es.get("velocity_ratio", 0)
+            uniq = es.get("unique_addrs_24h", 0)
+            whale = es.get("whale_tx_count_1h", 0)
+            tx1h = es.get("tx_count_1h", 0)
+            wvol = es.get("whale_volume_usd_24h", 0)
+            wvol_s = f"${wvol/1e6:.1f}M" if wvol >= 1e6 else f"${wvol/1e3:.0f}K"
             lines.append(
-                f"   🌌 Galaxy: {galaxy:.0f} | AltRank #{altrnk} | "
-                f"Sentiment: {sent:.0f}/100"
+                f"   🔍 Velocity: {vel:.1f}x | Whales(1h): {whale} | "
+                f"Addrs(24h): {uniq}"
+            )
+            lines.append(
+                f"   🐳 Tx(1h): {tx1h} | WhaleVol(24h): {wvol_s}"
             )
 
     # ④ Binance Futures
@@ -1023,7 +1156,7 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
 
     lines.append("")
 
-    # Price summary (best source available)
+    # Price summary
     price = 0
     if ds and ds.get("price_usd"):
         price = ds["price_usd"]
@@ -1048,10 +1181,14 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
 
     lines.append("")
 
-    # Whale insight
+    # Wall street insight
     if score >= 92:
-        lines.append("🎯 *تحليل وول ستريت:* 4+ مصادر متفقة بقوة. نمط صفقة قنّاصة — "
-                    "الحيتان تتموضع. تحقّق يدوي قبل الدخول.")
+        if is_evm and bk["etherscan"] >= 80:
+            lines.append("🎯 *تحليل وول ستريت:* on-chain whale activity ممتازة + إجماع مصادر "
+                        "= نمط Wintermute. دخول الحيتان مؤكّد. تحقّق يدوي قبل الدخول.")
+        else:
+            lines.append("🎯 *تحليل وول ستريت:* 4+ مصادر متفقة بقوة. صفقة قنّاصة. "
+                        "تحقّق يدوي قبل الدخول.")
     elif score >= 85:
         lines.append("🎯 *تحليل وول ستريت:* منطقة دخول الحيتان. on-chain volume يدعم.")
     elif score >= 75:
@@ -1066,12 +1203,14 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
 
 
 def build_alert_buttons(item: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
-    """Inline buttons for chart links (5 sources)."""
     sym = item["symbol"]
+    chain = item["chain"]
+    is_evm = item["is_evm"]
     ds  = item.get("ds_info", {})
     llama = item.get("llama_info", {})
     bin_i = item.get("bin_info", {})
     cp = item.get("cp_info", {})
+    es = item.get("es_info", {})
 
     rows = []
 
@@ -1089,21 +1228,22 @@ def build_alert_buttons(item: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
         btns1.append(InlineKeyboardButton("💧 DexScreener", url=ds["pair_url"]))
     rows.append(btns1)
 
-    # Row 2: Research
+    # Row 2: On-chain explorer (for EVM tokens) + DefiLlama
     btns2 = []
+    if is_evm and ds and ds.get("base_token_address"):
+        btns2.append(InlineKeyboardButton(
+            "🔍 Explorer",
+            url=_explorer_url(chain, ds["base_token_address"])
+        ))
     if llama and llama.get("url"):
         btns2.append(InlineKeyboardButton("🦙 DefiLlama", url=llama["url"]))
-    if cp and cp.get("id"):
-        btns2.append(InlineKeyboardButton(
-            "📊 CoinPaprika", url=f"https://coinpaprika.com/coin/{cp['id']}/"
-        ))
     if btns2:
         rows.append(btns2)
 
-    # Row 3: LunarCrush (if available)
-    if LUNARCRUSH_KEY:
+    # Row 3: CoinPaprika
+    if cp and cp.get("id"):
         rows.append([InlineKeyboardButton(
-            "🌌 LunarCrush", url=f"https://lunarcrush.com/coins/{sym.lower()}"
+            "📊 CoinPaprika", url=f"https://coinpaprika.com/coin/{cp['id']}/"
         )])
 
     return InlineKeyboardMarkup(rows) if rows else None
@@ -1114,7 +1254,6 @@ def build_alert_buttons(item: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
 # ══════════════════════════════════════════════════════════════════
 
 async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
-    """Main periodic scanner: 5 sources → aggregate → filter → alert."""
     job_data = context.job.data or {}
     chat_id = job_data.get("chat_id")
     if not chat_id:
@@ -1129,14 +1268,22 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         loop = asyncio.get_event_loop()
-        ds_data    = await loop.run_in_executor(None, fetch_dexscreener_data)
-        llama_data = await loop.run_in_executor(None, fetch_defillama_data)
-        lc_data    = await loop.run_in_executor(None, fetch_lunarcrush_data)
-        bin_data   = await loop.run_in_executor(None, fetch_binance_data)
-        cp_data    = await loop.run_in_executor(None, fetch_coinpaprika_data)
+
+        # DexScreener FIRST (provides addresses for Etherscan)
+        ds_data = await loop.run_in_executor(None, fetch_dexscreener_data)
+
+        # Then 4 in parallel (Etherscan needs DS data)
+        llama_task = loop.run_in_executor(None, fetch_defillama_data)
+        es_task    = loop.run_in_executor(None, fetch_etherscan_data, ds_data)
+        bin_task   = loop.run_in_executor(None, fetch_binance_data)
+        cp_task    = loop.run_in_executor(None, fetch_coinpaprika_data)
+
+        llama_data, es_data, bin_data, cp_data = await asyncio.gather(
+            llama_task, es_task, bin_task, cp_task
+        )
 
         aggregated = aggregate_hype_signals(
-            ds_data, llama_data, lc_data, bin_data, cp_data
+            ds_data, llama_data, es_data, bin_data, cp_data
         )
 
         global last_results
@@ -1169,6 +1316,7 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
                     "symbol": sym,
                     "score":  item["score"],
                     "mode":   mode,
+                    "is_evm": item.get("is_evm", False),
                 })
                 if len(alert_history) > 100:
                     alert_history.pop(0)
@@ -1186,85 +1334,51 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
 # 10. TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════
 
-def _build_start_msg() -> str:
-    """Build /start message with current weights based on LC availability."""
-    w = get_weights()
-    lc_line = ""
-    if LUNARCRUSH_KEY:
-        lc_line = f"🌌 LunarCrush    `{int(w['lunarcrush']*100)}%`  Galaxy Score\n"
-    else:
-        lc_line = "🌌 LunarCrush    `معطّل`  (لا يوجد مفتاح)\n"
-
-    return (
-        "🔥 *HYPE\\_BOT v2\\.0* — Whale\\-Style Multi\\-Source Scanner\n\n"
-        "أكشف العملات اللي عليها هايب من 5 مصادر مدمجة\\.\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "*المصادر \\& الأوزان:*\n"
-        f"💧 DexScreener   `{int(w['dexscreener']*100)}%`  on\\-chain volume\n"
-        f"🦙 DefiLlama     `{int(w['defillama']*100)}%`  TVL change\n"
-        + lc_line.replace("%", "\\%").replace("(", "\\(").replace(")", "\\)").replace("-", "\\-").replace(".", "\\.").replace("`", "`") +
-        f"🐋 Binance Fut\\.  `{int(w['binance']*100)}%`  OI \\+ price action\n"
-        f"📊 CoinPaprika   `{int(w['coinpaprika']*100)}%`  top gainers\n\n"
-        "*أوضاع الكشف \\(whale\\-style\\):*\n"
-        "🟢 `هايب`           ≥65  عادي\n"
-        "⚖️ `هايب متوازن`     ≥75  watchlist\n"
-        "💎 `هايب جودة`       ≥85  دخول المحترفين\n"
-        "👑 `هايب ذهبي`       ≥92  قنّاصة \\(نادر\\)\n\n"
-        "*أوامر إضافية:*\n"
-        "`/test`     فحص اتصال المصادر\n"
-        "`حالة`      حالة المصادر الـ5\n"
-        "`نتائج`     آخر 10 إشارات\n"
-        "`top10`     أعلى 10 عملات هايب الآن\n"
-        "`سجل`       سجل التنبيهات\n"
-        "`وقف`       إيقاف الكشف\n\n"
-        "⚠️ _تنفيذ يدوي — تعليمي فقط، ليس نصيحة مالية_"
-    )
-
-
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    # Use simpler Markdown to avoid escape issues
-    w = get_weights()
-    lc_line = (f"🌌 LunarCrush     `{int(w['lunarcrush']*100)}%`  Galaxy Score"
-               if LUNARCRUSH_KEY else
-               "🌌 LunarCrush     `معطّل`  (لا يوجد مفتاح)")
+    es_status = ("✅ مفعّل (5 مصادر للـ EVM)"
+                 if ETHERSCAN_KEY else "⚪ معطّل (لا يوجد مفتاح)")
 
     msg = (
-        "🔥 *HYPE_BOT v2.0* — Whale-Style Scanner\n\n"
-        "كاشف الهايب من 5 مصادر مدمجة بأوزان احترافية.\n"
+        "🔥 *HYPE_BOT v3.0* — Wintermute-Style Scanner\n\n"
+        "كاشف الهايب من 5 مصادر مدمجة بأوزان احترافية ديناميكية.\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "*المصادر والأوزان:*\n"
-        f"💧 DexScreener    `{int(w['dexscreener']*100)}%`  on-chain volume\n"
-        f"🦙 DefiLlama      `{int(w['defillama']*100)}%`  TVL change\n"
-        f"{lc_line}\n"
-        f"🐋 Binance Fut.   `{int(w['binance']*100)}%`  OI + price\n"
-        f"📊 CoinPaprika    `{int(w['coinpaprika']*100)}%`  top gainers\n\n"
+        "*المصادر والأوزان (chain-aware):*\n"
+        "💧 DexScreener    `35%`  on-chain DEX volume\n"
+        "🦙 DefiLlama      `20%`  TVL change\n"
+        f"🔍 Etherscan      `20%`  on-chain whale activity\n"
+        f"     {es_status}\n"
+        "🐋 Binance Fut.   `15%`  OI + price\n"
+        "📊 CoinPaprika    `10%`  retail trending\n\n"
+        "*ميزة Chain-Aware:*\n"
+        "للعملات EVM (ETH/BSC/Polygon/Arbitrum/Base/...): 5 مصادر\n"
+        "للعملات غير EVM (Solana/...): 4 مصادر (وزن Etherscan يُعاد توزيعه)\n\n"
         "*أوضاع الكشف:*\n"
         "🟢 `هايب`          ≥65  عادي\n"
         "⚖️ `هايب متوازن`    ≥75  watchlist\n"
         "💎 `هايب جودة`      ≥85  دخول المحترفين\n"
         "👑 `هايب ذهبي`      ≥92  قنّاصة (نادر)\n\n"
         "*أوامر إضافية:*\n"
-        "`/test`     فحص اتصال المصادر\n"
-        "`حالة`      حالة المصادر الـ5\n"
-        "`نتائج`     آخر 10 إشارات\n"
-        "`top10`     أعلى 10 عملات هايب\n"
-        "`سجل`       سجل التنبيهات\n"
-        "`وقف`       إيقاف الكشف\n\n"
+        "`/test`        فحص اتصال المصادر\n"
+        "`/esdebug`     تشخيص Etherscan\n"
+        "`حالة`         حالة المصادر الـ5\n"
+        "`نتائج`        آخر 10 إشارات\n"
+        "`top10`        أعلى 10 عملات هايب\n"
+        "`سجل`          سجل التنبيهات\n"
+        "`وقف`          إيقاف الكشف\n\n"
         "⚠️ _تنفيذ يدوي — تعليمي فقط_"
     )
     await u.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Connectivity test for 5 sources."""
     msg = await u.message.reply_text("⏳ فحص المصادر الخمسة...")
 
     loop = asyncio.get_event_loop()
-    ds    = await loop.run_in_executor(None, fetch_dexscreener_data)
+    ds = await loop.run_in_executor(None, fetch_dexscreener_data)
     llama = await loop.run_in_executor(None, fetch_defillama_data)
-    lc    = await loop.run_in_executor(None, fetch_lunarcrush_data)
+    es = await loop.run_in_executor(None, fetch_etherscan_data, ds)
     bin_d = await loop.run_in_executor(None, fetch_binance_data)
-    cp    = await loop.run_in_executor(None, fetch_coinpaprika_data)
+    cp = await loop.run_in_executor(None, fetch_coinpaprika_data)
 
     s = source_status
 
@@ -1274,36 +1388,134 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cnt = info.get("count", 0)
         out = f"{icon} *{name}*: {cnt} {count_label}"
         err = info.get("error")
-        if err and not info.get("ok"):
+        if err:
             out += f"\n   _{str(err)[:80]}_"
         return out
 
     lines = ["🔍 *نتيجة الفحص:*\n"]
     lines.append(line("DexScreener", "dexscreener", "رمز"))
     lines.append(line("DefiLlama",   "defillama",   "بروتوكول"))
-    if LUNARCRUSH_KEY:
-        lines.append(line("LunarCrush", "lunarcrush", "عملة"))
+    if ETHERSCAN_KEY:
+        lines.append(line("Etherscan", "etherscan", "EVM token"))
     else:
-        lines.append("⚪ *LunarCrush*: معطّل (لا يوجد مفتاح)")
+        lines.append("⚪ *Etherscan*: معطّل (لا يوجد مفتاح ETHERSCAN_KEY)")
     lines.append(line("Binance",     "binance",     "زوج USDT"))
     lines.append(line("CoinPaprika", "coinpaprika", "عملة"))
 
     active_count = sum(1 for v in s.values() if v.get("ok"))
-    expected = 5 if LUNARCRUSH_KEY else 4
+    expected = 5 if ETHERSCAN_KEY else 4
     lines.append("")
     if active_count >= expected - 1:
-        lines.append(f"🎯 *الحالة:* ممتازة ({active_count}/{expected})")
+        lines.append(f"🎯 *الحالة:* ممتازة ({active_count}/5 — متوقع {expected})")
     elif active_count >= expected // 2:
-        lines.append(f"⚠️ *الحالة:* مقبولة ({active_count}/{expected})")
+        lines.append(f"⚠️ *الحالة:* مقبولة ({active_count}/5)")
     else:
-        lines.append(f"🚨 *الحالة:* ضعيفة ({active_count}/{expected})")
+        lines.append(f"🚨 *الحالة:* ضعيفة ({active_count}/5)")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_esdebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Etherscan diagnostic — verifies key + endpoint + chain support."""
+    if not ETHERSCAN_KEY:
+        await u.message.reply_text(
+            "⚪ `ETHERSCAN_KEY` غير موجود في environment.\n"
+            "أضفه في Railway → Variables.",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = await u.message.reply_text("⏳ تشخيص Etherscan V2...")
+
+    loop = asyncio.get_event_loop()
+
+    def _test_chain(chainid: int, chain_name: str) -> dict:
+        """Light test: query gas price (free, fast)."""
+        try:
+            url = ETHERSCAN_BASE
+            params = {
+                "chainid": chainid,
+                "module": "stats",
+                "action": "ethsupply2",
+                "apikey": ETHERSCAN_KEY,
+            }
+            r = requests.get(url, params=params, timeout=10)
+            body_preview = (r.text or "")[:160].replace("\n", " ")
+            return {
+                "chain": chain_name,
+                "chainid": chainid,
+                "status": str(r.status_code),
+                "body": body_preview,
+                "ok": r.status_code == 200 and '"status":"1"' in (r.text or ""),
+            }
+        except Exception as e:
+            return {
+                "chain": chain_name,
+                "chainid": chainid,
+                "status": "EXCEPTION",
+                "body": f"{type(e).__name__}: {str(e)[:120]}",
+                "ok": False,
+            }
+
+    # Test 3 main EVM chains
+    test_chains = [
+        (1, "Ethereum"),
+        (56, "BSC"),
+        (137, "Polygon"),
+    ]
+
+    results = await asyncio.gather(*[
+        loop.run_in_executor(None, _test_chain, cid, name)
+        for cid, name in test_chains
+    ])
+
+    key_len = len(ETHERSCAN_KEY)
+    key_preview = (f"{ETHERSCAN_KEY[:6]}...{ETHERSCAN_KEY[-4:]}"
+                   if key_len > 10 else "(short)")
+    has_whitespace = ETHERSCAN_KEY != ETHERSCAN_KEY.strip()
+
+    lines = [
+        "🔬 *Etherscan V2 Diagnostic*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🔑 Key length: `{key_len}` chars",
+        f"🔑 Preview: `{key_preview}`",
+    ]
+    if has_whitespace:
+        lines.append("⚠️ *تحذير*: الـ key فيه whitespace!")
+    lines.append("")
+    lines.append(f"🌐 URL: `{ETHERSCAN_BASE}`")
+    lines.append("")
+
+    for r in results:
+        icon = "✅" if r["ok"] else "❌"
+        lines.append(f"{icon} *{r['chain']}* (chainid={r['chainid']})")
+        lines.append(f"   Status: `{r['status']}`")
+        body_clean = r["body"][:100].replace("`", "'")
+        lines.append(f"   Body: `{body_clean}`")
+        lines.append("")
+
+    # Recommendation
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    ok_count = sum(1 for r in results if r["ok"])
+    if ok_count == 3:
+        lines.append("✅ *النتيجة*: Etherscan V2 يعمل بشكل ممتاز على جميع الـ EVM chains.")
+    elif ok_count >= 1:
+        lines.append(f"⚠️ *النتيجة*: {ok_count}/3 شبكات تعمل. الباقي قد يكون rate-limited.")
+    else:
+        statuses = [r["status"] for r in results]
+        if "401" in statuses or "403" in statuses:
+            lines.append("🔐 *النتيجة*: مشكلة auth — تحقق من ETHERSCAN_KEY.")
+        elif "429" in statuses:
+            lines.append("⏱ *النتيجة*: rate limit — انتظر دقيقة.")
+        else:
+            lines.append("❓ *النتيجة*: غير واضح. أرسل screenshot لي.")
 
     await msg.delete()
     await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Main text-message router."""
     if not u.message or not u.message.text:
         return
 
@@ -1311,7 +1523,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text_l  = text.lower()
     chat_id = u.effective_chat.id
 
-    # ── تفعيل الكشف ──
+    # ── تفعيل ──
     if text.startswith("هايب") or text_l in ("hype", "start hype"):
         mode = "عادي"
         if "متوازن" in text or "balance" in text_l:
@@ -1323,9 +1535,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         cfg = MODES[mode]
         chat_config[chat_id] = {
-            "active":    True,
-            "mode":      mode,
-            "min_score": cfg["min"],
+            "active": True, "mode": mode, "min_score": cfg["min"],
         }
 
         for j in c.job_queue.get_jobs_by_name(f"hype_{chat_id}"):
@@ -1339,16 +1549,17 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             name=f"hype_{chat_id}",
         )
 
-        sources_active = "5/5 مصادر" if LUNARCRUSH_KEY else "4/5 مصادر (LC معطّل)"
+        sources_info = ("5/5 مصادر (EVM) أو 4/5 (non-EVM)"
+                        if ETHERSCAN_KEY else "4/5 مصادر (Etherscan معطّل)")
 
         await u.message.reply_text(
             f"🚨 *تم تفعيل كاشف الهايب*\n\n"
             f"⚙️ الوضع: {cfg['label']}\n"
             f"🎯 الحد الأدنى: `{cfg['min']}/100`\n"
             f"📊 الحد الأدنى للمصادر: `{cfg['min_sources']}`\n"
-            f"📡 المصادر النشطة: `{sources_active}`\n"
+            f"📡 المصادر: `{sources_info}`\n"
             f"⏱ المسح: كل {SCAN_INTERVAL_SEC // 60} دقائق\n"
-            f"❄️ Cooldown: ساعة واحدة لكل عملة\n\n"
+            f"❄️ Cooldown: ساعة لكل عملة\n\n"
             f"⚠️ تنفيذ يدوي — تعليمي فقط\n"
             f"للإيقاف: `وقف`",
             parse_mode="Markdown"
@@ -1363,7 +1574,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("⛔ *تم إيقاف كاشف الهايب*", parse_mode="Markdown")
         return
 
-    # ── حالة المصادر ──
+    # ── حالة ──
     if text_l in ("حالة", "status"):
         s = source_status
         lines = ["📡 *حالة المصادر الـ5:*\n"]
@@ -1371,7 +1582,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         sources_order = [
             ("💧 DexScreener", "dexscreener"),
             ("🦙 DefiLlama",   "defillama"),
-            ("🌌 LunarCrush",  "lunarcrush"),
+            ("🔍 Etherscan",   "etherscan"),
             ("🐋 Binance",     "binance"),
             ("📊 CoinPaprika", "coinpaprika"),
         ]
@@ -1405,15 +1616,14 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         active_cooldowns = sum(1 for sym in seen_coins if is_in_cooldown(sym))
         lines.append(f"❄️ عملات في cooldown: {active_cooldowns}")
 
-        # Weights summary
-        w = get_weights()
+        # Show weights summary
         lines.append("")
         lines.append("⚖️ *الأوزان النشطة:*")
-        lines.append(
-            f"💧{int(w['dexscreener']*100)}% 🦙{int(w['defillama']*100)}% "
-            f"🌌{int(w['lunarcrush']*100)}% 🐋{int(w['binance']*100)}% "
-            f"📊{int(w['coinpaprika']*100)}%"
-        )
+        if ETHERSCAN_KEY:
+            lines.append(f"EVM: 💧35% 🦙20% 🔍20% 🐋15% 📊10%")
+            lines.append(f"non-EVM: 💧45% 🦙25% 🔍0% 🐋18% 📊12%")
+        else:
+            lines.append(f"الكل: 💧45% 🦙25% 🔍0% 🐋18% 📊12% (Etherscan معطّل)")
 
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
@@ -1429,9 +1639,10 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lines = [f"📊 *آخر مسح ({len(last_results)} إشارة):*\n"]
         for i, item in enumerate(last_results[:10], 1):
             grade = _grade_label(item["score"])
+            evm_tag = "🟢 EVM" if item.get("is_evm") else "🔵 non-EVM"
             lines.append(
                 f"{i}. *{item['symbol']}* `{item['score']}/100` "
-                f"({item['sources_count']}/{5 if LUNARCRUSH_KEY else 4}) {grade}"
+                f"({item['sources_count']}/5) {grade} {evm_tag}"
             )
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
@@ -1447,10 +1658,11 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lines = ["🏆 *أعلى 10 عملات هايب:*\n"]
         for i, item in enumerate(last_results[:10], 1):
             bk = item["breakdown"]
-            lines.append(f"{i}. *{item['symbol']}* `{item['score']}/100`")
+            evm_tag = "🟢" if item.get("is_evm") else "🔵"
+            lines.append(f"{i}. {evm_tag} *{item['symbol']}* `{item['score']}/100`")
             lines.append(
                 f"   💧{bk['dexscreener']:.0f} 🦙{bk['defillama']:.0f} "
-                f"🌌{bk['lunarcrush']:.0f} 🐋{bk['binance']:.0f} "
+                f"🔍{bk['etherscan']:.0f} 🐋{bk['binance']:.0f} "
                 f"📊{bk['coinpaprika']:.0f}"
             )
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -1468,141 +1680,15 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 t = dt.strftime("%H:%M")
             except Exception:
                 t = "—"
-            lines.append(f"• `{t}` *{h['symbol']}* {h['score']}/100 ({h['mode']})")
+            evm_tag = "🟢" if h.get("is_evm") else "🔵"
+            lines.append(f"• `{t}` {evm_tag} *{h['symbol']}* {h['score']}/100 ({h['mode']})")
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
-    # ── unknown ──
     await u.message.reply_text(
         "🤖 لم أفهم الأمر.\n\nأرسل `/start` لرؤية القائمة الكاملة.",
         parse_mode="Markdown"
     )
-
-
-async def cmd_lcdebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Verbose LunarCrush diagnostic — tries 3 auth methods + reports raw responses."""
-    if not LUNARCRUSH_KEY:
-        await u.message.reply_text(
-            "⚪ `LUNARCRUSH_KEY` غير موجود في environment.\n"
-            "أضفه في Railway → Variables.",
-            parse_mode="Markdown"
-        )
-        return
-
-    msg = await u.message.reply_text("⏳ تشخيص LunarCrush بـ3 طرق...")
-
-    url = f"{LC_BASE}/coins/list/v2"
-    loop = asyncio.get_event_loop()
-
-    def _try_method(name: str, **kwargs):
-        try:
-            r = requests.get(url, timeout=15, **kwargs)
-            body = (r.text or "(empty)")[:200].replace("\n", " ")
-            return {
-                "name": name,
-                "status": str(r.status_code),
-                "body": body,
-                "ok": r.status_code == 200,
-                "elapsed_ms": int(r.elapsed.total_seconds() * 1000),
-            }
-        except Exception as e:
-            return {
-                "name": name,
-                "status": "EXCEPTION",
-                "body": f"{type(e).__name__}: {str(e)[:180]}",
-                "ok": False,
-                "elapsed_ms": 0,
-            }
-
-    # Method 1: Current implementation (Bearer + bot UA)
-    r1 = await loop.run_in_executor(None, lambda: _try_method(
-        "1️⃣ Bearer + Bot UA (الحالي)",
-        headers={
-            "Authorization": f"Bearer {LUNARCRUSH_KEY}",
-            "User-Agent": "Mozilla/5.0 (compatible; HypeBot/2.0)",
-            "Accept": "application/json",
-        },
-        params={"limit": 5},
-    ))
-
-    # Method 2: Bearer + browser UA (Cloudflare bypass attempt)
-    r2 = await loop.run_in_executor(None, lambda: _try_method(
-        "2️⃣ Bearer + Browser UA",
-        headers={
-            "Authorization": f"Bearer {LUNARCRUSH_KEY}",
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/120.0.0.0 Safari/537.36"),
-            "Accept": "application/json",
-        },
-        params={"limit": 5},
-    ))
-
-    # Method 3: Query param ?key= (legacy auth)
-    r3 = await loop.run_in_executor(None, lambda: _try_method(
-        "3️⃣ Query Param ?key=",
-        params={"key": LUNARCRUSH_KEY, "limit": 5},
-        headers={"Accept": "application/json"},
-    ))
-
-    # Build report
-    key_len = len(LUNARCRUSH_KEY)
-    key_preview = f"{LUNARCRUSH_KEY[:6]}...{LUNARCRUSH_KEY[-4:]}" if key_len > 10 else "(short)"
-    has_whitespace = LUNARCRUSH_KEY != LUNARCRUSH_KEY.strip()
-
-    lines = [
-        "🔬 *LunarCrush Deep Diagnostic*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🔑 Key length: `{key_len}` chars",
-        f"🔑 Preview: `{key_preview}`",
-    ]
-    if has_whitespace:
-        lines.append("⚠️ *تحذير*: الـ key فيه whitespace! امسحه وألصق نظيف.")
-    lines.append("")
-    lines.append(f"🌐 URL: `{url}`")
-    lines.append("")
-
-    for r in (r1, r2, r3):
-        icon = "✅" if r["ok"] else "❌"
-        lines.append(f"{icon} *{r['name']}*")
-        lines.append(f"   Status: `{r['status']}` ({r['elapsed_ms']}ms)")
-        body_clean = r["body"][:140].replace("`", "'")
-        lines.append(f"   Body: `{body_clean}`")
-        lines.append("")
-
-    # Recommendation based on results
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    if r1["ok"]:
-        lines.append("✅ *النتيجة*: الإعداد الحالي يجب أن يعمل!")
-        lines.append("جرّب `/test` مرة أخرى.")
-    elif r2["ok"]:
-        lines.append("🎯 *النتيجة*: User-Agent هو السبب!")
-        lines.append("Cloudflare يحظر bot UA. سأرسل لك hotfix.")
-    elif r3["ok"]:
-        lines.append("🎯 *النتيجة*: استخدم query param بدل Bearer.")
-        lines.append("سأرسل لك hotfix.")
-    else:
-        # All failed — analyze status codes
-        statuses = [r["status"] for r in (r1, r2, r3)]
-        if "401" in statuses or "403" in statuses:
-            lines.append("🔐 *النتيجة*: مشكلة authentication.")
-            lines.append("- تحقق من LUNARCRUSH_KEY في Railway Variables")
-            lines.append("- جدّد الـ key من lunarcrush.com")
-        elif "429" in statuses:
-            lines.append("⏱ *النتيجة*: rate limit.")
-            lines.append("- تجاوزت 10 req/min على الخطة المجانية")
-            lines.append("- انتظر دقيقة وأعد المحاولة")
-        elif "404" in statuses:
-            lines.append("🔍 *النتيجة*: endpoint غير موجود.")
-            lines.append("LunarCrush غيّر API. سأبحث عن الجديد.")
-        elif any("EXCEPTION" in s for s in statuses):
-            lines.append("🌐 *النتيجة*: مشكلة network/DNS.")
-            lines.append("Railway europe-west4 ربما محظور من LC.")
-        else:
-            lines.append("❓ *النتيجة*: غير واضح. أرسل screenshot لي.")
-
-    await msg.delete()
-    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def error_handler(update, context):
@@ -1615,7 +1701,7 @@ async def error_handler(update, context):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 11. POST INIT
+# 11. MAIN
 # ══════════════════════════════════════════════════════════════════
 
 async def _post_init(app):
@@ -1626,24 +1712,21 @@ async def _post_init(app):
         log.warning(f"webhook clear failed: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════
-# 12. MAIN
-# ══════════════════════════════════════════════════════════════════
-
 def _print_banner():
-    w = get_weights()
-    lc_status = (f"✅ مفعّل ({int(w['lunarcrush']*100)}%)"
-                 if LUNARCRUSH_KEY else "⚪ معطّل (لا يوجد مفتاح)")
+    es_status = ("✅ مفعّل (chain-aware)"
+                 if ETHERSCAN_KEY else "⚪ معطّل (لا يوجد مفتاح)")
 
     print("=" * 70)
-    print("  🔥 HYPE_BOT v2.0 — Running ✅")
+    print("  🔥 HYPE_BOT v3.0 — Wintermute-Style Scanner ✅")
     print("=" * 70)
-    print(f"  المعمارية      : {'5 مصادر' if LUNARCRUSH_KEY else '4 مصادر'} (Whale-weighted)")
-    print(f"    💧 DexScreener  : ✅ مجاني ({int(w['dexscreener']*100)}%)")
-    print(f"    🦙 DefiLlama    : ✅ مجاني ({int(w['defillama']*100)}%)")
-    print(f"    🌌 LunarCrush   : {lc_status}")
-    print(f"    🐋 Binance Fut. : ✅ مجاني ({int(w['binance']*100)}%)")
-    print(f"    📊 CoinPaprika  : ✅ مجاني ({int(w['coinpaprika']*100)}%)")
+    print(f"  المعمارية      : 5 مصادر (chain-aware dynamic weights)")
+    print(f"    💧 DexScreener  : ✅ مجاني (35% EVM / 45% non-EVM)")
+    print(f"    🦙 DefiLlama    : ✅ مجاني (20% EVM / 25% non-EVM)")
+    print(f"    🔍 Etherscan V2 : {es_status}  (20% EVM / 0% non-EVM)")
+    print(f"    🐋 Binance Fut. : ✅ مجاني (15% EVM / 18% non-EVM)")
+    print(f"    📊 CoinPaprika  : ✅ مجاني (10% EVM / 12% non-EVM)")
+    print(f"  EVM chains      : ETH, BSC, Polygon, Arbitrum, Optimism,")
+    print(f"                    Base, Avalanche, Fantom, Linea, Blast")
     print(f"  الأوضاع         : 4 (65 / 75 / 85 / 92)")
     print(f"  المسح           : كل {SCAN_INTERVAL_SEC // 60} دقائق")
     print(f"  Cooldown        : ساعة لكل عملة")
@@ -1670,7 +1753,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
-    app.add_handler(CommandHandler("lcdebug", cmd_lcdebug))
+    app.add_handler(CommandHandler("esdebug", cmd_esdebug))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_msg
     ))
