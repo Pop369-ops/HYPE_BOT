@@ -1479,6 +1479,132 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_lcdebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Verbose LunarCrush diagnostic — tries 3 auth methods + reports raw responses."""
+    if not LUNARCRUSH_KEY:
+        await u.message.reply_text(
+            "⚪ `LUNARCRUSH_KEY` غير موجود في environment.\n"
+            "أضفه في Railway → Variables.",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = await u.message.reply_text("⏳ تشخيص LunarCrush بـ3 طرق...")
+
+    url = f"{LC_BASE}/coins/list/v2"
+    loop = asyncio.get_event_loop()
+
+    def _try_method(name: str, **kwargs):
+        try:
+            r = requests.get(url, timeout=15, **kwargs)
+            body = (r.text or "(empty)")[:200].replace("\n", " ")
+            return {
+                "name": name,
+                "status": str(r.status_code),
+                "body": body,
+                "ok": r.status_code == 200,
+                "elapsed_ms": int(r.elapsed.total_seconds() * 1000),
+            }
+        except Exception as e:
+            return {
+                "name": name,
+                "status": "EXCEPTION",
+                "body": f"{type(e).__name__}: {str(e)[:180]}",
+                "ok": False,
+                "elapsed_ms": 0,
+            }
+
+    # Method 1: Current implementation (Bearer + bot UA)
+    r1 = await loop.run_in_executor(None, lambda: _try_method(
+        "1️⃣ Bearer + Bot UA (الحالي)",
+        headers={
+            "Authorization": f"Bearer {LUNARCRUSH_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; HypeBot/2.0)",
+            "Accept": "application/json",
+        },
+        params={"limit": 5},
+    ))
+
+    # Method 2: Bearer + browser UA (Cloudflare bypass attempt)
+    r2 = await loop.run_in_executor(None, lambda: _try_method(
+        "2️⃣ Bearer + Browser UA",
+        headers={
+            "Authorization": f"Bearer {LUNARCRUSH_KEY}",
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept": "application/json",
+        },
+        params={"limit": 5},
+    ))
+
+    # Method 3: Query param ?key= (legacy auth)
+    r3 = await loop.run_in_executor(None, lambda: _try_method(
+        "3️⃣ Query Param ?key=",
+        params={"key": LUNARCRUSH_KEY, "limit": 5},
+        headers={"Accept": "application/json"},
+    ))
+
+    # Build report
+    key_len = len(LUNARCRUSH_KEY)
+    key_preview = f"{LUNARCRUSH_KEY[:6]}...{LUNARCRUSH_KEY[-4:]}" if key_len > 10 else "(short)"
+    has_whitespace = LUNARCRUSH_KEY != LUNARCRUSH_KEY.strip()
+
+    lines = [
+        "🔬 *LunarCrush Deep Diagnostic*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🔑 Key length: `{key_len}` chars",
+        f"🔑 Preview: `{key_preview}`",
+    ]
+    if has_whitespace:
+        lines.append("⚠️ *تحذير*: الـ key فيه whitespace! امسحه وألصق نظيف.")
+    lines.append("")
+    lines.append(f"🌐 URL: `{url}`")
+    lines.append("")
+
+    for r in (r1, r2, r3):
+        icon = "✅" if r["ok"] else "❌"
+        lines.append(f"{icon} *{r['name']}*")
+        lines.append(f"   Status: `{r['status']}` ({r['elapsed_ms']}ms)")
+        body_clean = r["body"][:140].replace("`", "'")
+        lines.append(f"   Body: `{body_clean}`")
+        lines.append("")
+
+    # Recommendation based on results
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    if r1["ok"]:
+        lines.append("✅ *النتيجة*: الإعداد الحالي يجب أن يعمل!")
+        lines.append("جرّب `/test` مرة أخرى.")
+    elif r2["ok"]:
+        lines.append("🎯 *النتيجة*: User-Agent هو السبب!")
+        lines.append("Cloudflare يحظر bot UA. سأرسل لك hotfix.")
+    elif r3["ok"]:
+        lines.append("🎯 *النتيجة*: استخدم query param بدل Bearer.")
+        lines.append("سأرسل لك hotfix.")
+    else:
+        # All failed — analyze status codes
+        statuses = [r["status"] for r in (r1, r2, r3)]
+        if "401" in statuses or "403" in statuses:
+            lines.append("🔐 *النتيجة*: مشكلة authentication.")
+            lines.append("- تحقق من LUNARCRUSH_KEY في Railway Variables")
+            lines.append("- جدّد الـ key من lunarcrush.com")
+        elif "429" in statuses:
+            lines.append("⏱ *النتيجة*: rate limit.")
+            lines.append("- تجاوزت 10 req/min على الخطة المجانية")
+            lines.append("- انتظر دقيقة وأعد المحاولة")
+        elif "404" in statuses:
+            lines.append("🔍 *النتيجة*: endpoint غير موجود.")
+            lines.append("LunarCrush غيّر API. سأبحث عن الجديد.")
+        elif any("EXCEPTION" in s for s in statuses):
+            lines.append("🌐 *النتيجة*: مشكلة network/DNS.")
+            lines.append("Railway europe-west4 ربما محظور من LC.")
+        else:
+            lines.append("❓ *النتيجة*: غير واضح. أرسل screenshot لي.")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def error_handler(update, context):
     log.warning(f"[ERR] {context.error}")
     try:
@@ -1544,6 +1670,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("lcdebug", cmd_lcdebug))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_msg
     ))
