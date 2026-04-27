@@ -1,20 +1,22 @@
 """
 ╔═══════════════════════════════════════════════════════════════════╗
-║                       HYPE_BOT v1.0                              ║
-║          كاشف الهايب — Whale-Style Signal Scanner                ║
+║                       HYPE_BOT v2.0                              ║
+║       كاشف الهايب — Whale-Style Multi-Source Scanner             ║
 ║                                                                   ║
-║  4 مصادر مدمجة بأوزان احترافية:                                 ║
-║    💧 DexScreener  — 35%  (on-chain volume, hardest to fake)    ║
-║    🌌 LunarCrush   — 30%  (Galaxy Score, social momentum)       ║
-║    📰 CryptoPanic  — 20%  (news catalyst)                       ║
-║    📈 CoinGecko    — 15%  (retail trending — confirmation)      ║
+║  5 مصادر مدمجة بأوزان احترافية ديناميكية:                       ║
+║    💧 DexScreener  — 40% (50% بدون LC)  on-chain volume         ║
+║    🦙 DefiLlama    — 20% (25% بدون LC)  TVL change              ║
+║    🌌 LunarCrush   — 20% (اختياري)       Galaxy Score           ║
+║    🐋 Binance Fut. — 12% (15% بدون LC)  OI + price action       ║
+║    📊 CoinPaprika  —  8% (10% بدون LC)  top gainers             ║
 ║                                                                   ║
 ║  4 أوضاع كشف بمنطق الحيتان (high-conviction only):              ║
-║    🟢 هايب          ≥65  (filter retail noise)                  ║
-║    ⚖️ هايب متوازن    ≥75  (whale watchlist)                     ║
-║    💎 هايب جودة      ≥85  (whale entry zone)                    ║
-║    👑 هايب ذهبي      ≥92  (sniper signals, 4/4 sources)        ║
+║    🟢 هايب          ≥65  filter retail noise                    ║
+║    ⚖️ هايب متوازن    ≥75  whale watchlist                       ║
+║    💎 هايب جودة      ≥85  whale entry zone                      ║
+║    👑 هايب ذهبي      ≥92  sniper signals                        ║
 ║                                                                   ║
+║  100% مجاني (LunarCrush اختياري)                                 ║
 ║  للأغراض التعليمية فقط — ليس نصيحة مالية                        ║
 ╚═══════════════════════════════════════════════════════════════════╝
 """
@@ -23,7 +25,6 @@ import os
 import time
 import asyncio
 import logging
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from collections import defaultdict
@@ -47,44 +48,62 @@ logging.basicConfig(
 )
 log = logging.getLogger("HYPE_BOT")
 
-# ── API Keys (from Railway Variables) ──
+# ── API Keys (only BOT_TOKEN required, LunarCrush optional) ──
 BOT_TOKEN        = os.environ.get("BOT_TOKEN", "").strip()
 LUNARCRUSH_KEY   = os.environ.get("LUNARCRUSH_KEY", "").strip()
-CRYPTOPANIC_KEY  = os.environ.get("CRYPTOPANIC_KEY", "").strip()
-COINGECKO_KEY    = os.environ.get("COINGECKO_KEY", "").strip()
 
-# ── Endpoints ──
-CG_BASE   = "https://api.coingecko.com/api/v3"
-LC_BASE   = "https://lunarcrush.com/api4/public"
+# ── Endpoints (all free, no auth needed except LC) ──
 DS_BASE   = "https://api.dexscreener.com"
-CP_BASE   = "https://cryptopanic.com/api/v1"
+LLAMA_BASE = "https://api.llama.fi"
+BIN_FAPI  = "https://fapi.binance.com/fapi/v1"
+CP_BASE   = "https://api.coinpaprika.com/v1"
+LC_BASE   = "https://lunarcrush.com/api4/public"
 
-# ── Source Weights (whale-style) ──
-W_DEX     = 0.35
-W_LC      = 0.30
-W_CP      = 0.20
-W_CG      = 0.15
+# ── Source Weights (dynamic, computed at runtime) ──
+# Base weights when LunarCrush IS available (5-source mode):
+W_5SRC = {
+    "dexscreener": 0.40,
+    "defillama":   0.20,
+    "lunarcrush":  0.20,
+    "binance":     0.12,
+    "coinpaprika": 0.08,
+}
 
-# ── Mode Thresholds ──
+# Fallback weights when LunarCrush IS NOT available (4-source mode):
+W_4SRC = {
+    "dexscreener": 0.50,
+    "defillama":   0.25,
+    "lunarcrush":  0.00,    # disabled
+    "binance":     0.15,
+    "coinpaprika": 0.10,
+}
+
+def get_weights() -> Dict[str, float]:
+    """Return active weights based on LC key availability."""
+    return W_5SRC if LUNARCRUSH_KEY else W_4SRC
+
+
+# ── Mode Thresholds (whale-style, conviction-based) ──
 MODES = {
-    "عادي":    {"min": 65, "min_sources": 2, "label": "🟢 عادي",      "min_per_source": 0},
-    "متوازن":  {"min": 75, "min_sources": 3, "label": "⚖️ متوازن",    "min_per_source": 50},
-    "جودة":    {"min": 85, "min_sources": 3, "label": "💎 جودة",      "min_per_source": 60},
-    "ذهبي":    {"min": 92, "min_sources": 4, "label": "👑 ذهبي",      "min_per_source": 70},
+    "عادي":    {"min": 65, "min_sources": 2, "label": "🟢 عادي",   "min_per_source": 0},
+    "متوازن":  {"min": 75, "min_sources": 3, "label": "⚖️ متوازن", "min_per_source": 50},
+    "جودة":    {"min": 85, "min_sources": 3, "label": "💎 جودة",   "min_per_source": 60},
+    "ذهبي":    {"min": 92, "min_sources": 4, "label": "👑 ذهبي",   "min_per_source": 70},
 }
 
 # ── Operational Constants ──
-SCAN_INTERVAL_SEC = 300                  # دورة المسح الكاملة كل 5 دقائق
-COOLDOWN_HOURS    = 1                    # ساعة لكل عملة (تعديل المستخدم)
-MAX_RESULTS_KEPT  = 50                   # آخر 50 نتيجة في الذاكرة
-MIN_LIQUIDITY_USD = 100_000              # سيولة DEX دنيا (anti-rug)
-MAX_AGE_DAYS      = 365                  # العملات الجديدة جداً مستبعدة
+SCAN_INTERVAL_SEC = 300                  # full scan cycle every 5 minutes
+COOLDOWN_HOURS    = 1                    # 1 hour per coin (user pref)
+MAX_RESULTS_KEPT  = 50
+MIN_LIQUIDITY_USD = 100_000              # DEX rug filter
+MIN_BINANCE_VOL   = 500_000              # min 24h quote volume
 
-# ── Blacklist (stablecoins + wrapped) ──
+# ── Blacklist (stablecoins + wrapped + obvious junk) ──
 BLACKLIST = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDD", "USDP",
     "WBTC", "WETH", "STETH", "WSTETH", "WBNB", "WMATIC", "USDE",
-    "GUSD", "PYUSD", "FRAX", "SUSDS",
+    "GUSD", "PYUSD", "FRAX", "SUSDS", "SUSDE", "USDS", "RLUSD",
+    "USD0", "USDX", "EURS", "EURT",
 }
 
 # ── Timezone ──
@@ -101,15 +120,16 @@ chat_config: Dict[int, Dict[str, Any]] = {}
 # {symbol: timestamp_iso} — cooldown tracker
 seen_coins: Dict[str, str] = {}
 
-# Last scan results (list of dicts)
+# Last scan results
 last_results: List[Dict[str, Any]] = []
 
-# Source health status
+# Source health status (5 sources now)
 source_status: Dict[str, Dict[str, Any]] = {
-    "coingecko":   {"ok": False, "last_check": None, "error": None},
-    "lunarcrush":  {"ok": False, "last_check": None, "error": None},
-    "dexscreener": {"ok": False, "last_check": None, "error": None},
-    "cryptopanic": {"ok": False, "last_check": None, "error": None},
+    "dexscreener": {"ok": False, "last_check": None, "error": None, "count": 0},
+    "defillama":   {"ok": False, "last_check": None, "error": None, "count": 0},
+    "lunarcrush":  {"ok": False, "last_check": None, "error": None, "count": 0},
+    "binance":     {"ok": False, "last_check": None, "error": None, "count": 0},
+    "coinpaprika": {"ok": False, "last_check": None, "error": None, "count": 0},
 }
 
 # Alert history (last 100)
@@ -120,10 +140,9 @@ alert_history: List[Dict[str, Any]] = []
 # 3. HTTP HELPER
 # ══════════════════════════════════════════════════════════════════
 
-# Persistent session for connection pooling
 _session = requests.Session()
 _session.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; HypeBot/1.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; HypeBot/2.0)",
     "Accept": "application/json",
 })
 
@@ -132,7 +151,7 @@ def safe_get(url: str, params: Optional[dict] = None,
              headers: Optional[dict] = None,
              timeout: tuple = (5, 20),
              retries: int = 2) -> Optional[Any]:
-    """طلب آمن مع إعادة المحاولة."""
+    """طلب آمن مع إعادة المحاولة وحماية من rate limits."""
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -141,13 +160,17 @@ def safe_get(url: str, params: Optional[dict] = None,
                 h.update(headers)
             r = _session.get(url, params=params, headers=h, timeout=timeout)
             if r.status_code == 200:
-                return r.json()
-            elif r.status_code == 429:  # rate limit — wait and retry
-                last_err = f"429 rate limit"
+                try:
+                    return r.json()
+                except ValueError:
+                    return r.text
+            elif r.status_code == 429:
+                last_err = "429 rate limit"
                 time.sleep(2 ** attempt)
                 continue
             elif r.status_code in (401, 403):
-                return {"_auth_error": r.status_code, "_text": r.text[:200]}
+                return {"_auth_error": r.status_code,
+                        "_text": r.text[:200] if r.text else "no body"}
             else:
                 last_err = f"HTTP {r.status_code}"
         except requests.exceptions.Timeout:
@@ -168,127 +191,43 @@ def now_str() -> str:
     return datetime.now(TZ_RIYADH).strftime("%H:%M:%S")
 
 
+def normalize_sym(s: str) -> str:
+    """Strip USDT/BUSD suffix and uppercase."""
+    s = (s or "").upper().strip()
+    for suffix in ("USDT", "BUSD", "USDC", "USD"):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return s[:-len(suffix)]
+    return s
+
+
 # ══════════════════════════════════════════════════════════════════
-# 4. SOURCE FETCHERS (4 sources)
+# 4. SOURCE FETCHERS (5 sources, all returning {SYM_UPPER: data_dict})
 # ══════════════════════════════════════════════════════════════════
 
-# ── ① CoinGecko Trending ──
-def fetch_coingecko_trending() -> Dict[str, Dict]:
-    """
-    GET /search/trending → top 15 trending coins by 24h search volume.
-    Returns: {symbol_upper: {rank, name, market_cap_rank, score}}
-    """
-    headers = {}
-    if COINGECKO_KEY:
-        headers["x-cg-demo-api-key"] = COINGECKO_KEY
-
-    data = safe_get(f"{CG_BASE}/search/trending", headers=headers)
-    if not data or "_auth_error" in (data or {}):
-        source_status["coingecko"] = {
-            "ok": False,
-            "last_check": now_iso(),
-            "error": data.get("_text", "unreachable") if data else "unreachable",
-        }
-        return {}
-
-    out = {}
-    coins = data.get("coins", [])
-    for idx, entry in enumerate(coins[:15]):
-        item = entry.get("item", {})
-        sym = (item.get("symbol") or "").upper()
-        if not sym or sym in BLACKLIST:
-            continue
-        out[sym] = {
-            "rank": idx + 1,                              # 1..15
-            "name": item.get("name", ""),
-            "cg_id": item.get("id", ""),
-            "market_cap_rank": item.get("market_cap_rank") or 9999,
-            "thumb": item.get("thumb", ""),
-            "score": item.get("score", 0),                # internal CG score
-        }
-
-    source_status["coingecko"] = {
-        "ok": True, "last_check": now_iso(), "error": None
-    }
-    log.info(f"[CG] {len(out)} trending coins fetched")
-    return out
-
-
-# ── ② LunarCrush Galaxy Score ──
-def fetch_lunarcrush_data() -> Dict[str, Dict]:
-    """
-    GET /coins/list/v2 → top coins with social metrics.
-    Returns: {symbol_upper: {galaxy_score, alt_rank, social_volume, ...}}
-    """
-    if not LUNARCRUSH_KEY:
-        source_status["lunarcrush"] = {
-            "ok": False, "last_check": now_iso(),
-            "error": "no API key (optional but recommended)",
-        }
-        return {}
-
-    headers = {"Authorization": f"Bearer {LUNARCRUSH_KEY}"}
-    data = safe_get(f"{LC_BASE}/coins/list/v2",
-                    params={"limit": 100, "sort": "galaxy_score"},
-                    headers=headers)
-
-    if not data or "_auth_error" in (data or {}):
-        source_status["lunarcrush"] = {
-            "ok": False, "last_check": now_iso(),
-            "error": data.get("_text", "auth/unreachable") if data else "unreachable",
-        }
-        return {}
-
-    out = {}
-    items = data.get("data", []) if isinstance(data, dict) else []
-    for c in items:
-        sym = (c.get("symbol") or "").upper()
-        if not sym or sym in BLACKLIST:
-            continue
-        out[sym] = {
-            "galaxy_score":      float(c.get("galaxy_score") or 0),       # 0-100
-            "alt_rank":          int(c.get("alt_rank") or 9999),
-            "social_volume_24h": float(c.get("interactions_24h") or 0),
-            "social_dominance":  float(c.get("social_dominance") or 0),
-            "sentiment":         float(c.get("sentiment") or 50),         # 0-100
-            "price":             float(c.get("price") or 0),
-            "percent_change_24h": float(c.get("percent_change_24h") or 0),
-        }
-
-    source_status["lunarcrush"] = {
-        "ok": True, "last_check": now_iso(), "error": None
-    }
-    log.info(f"[LC] {len(out)} coins with Galaxy Score fetched")
-    return out
-
-
-# ── ③ DexScreener Boosted Tokens + Volume Surge ──
+# ── ① DexScreener: Boosted tokens + volume surge ──
 def fetch_dexscreener_data() -> Dict[str, Dict]:
     """
-    1) Get top boosted tokens (proxy for trending DEX activity)
-    2) For each unique token, fetch pair data with volume metrics
-    Returns: {symbol_upper: {volume_h1, volume_h6, vol_change_pct, liquidity_usd, ...}}
+    1) GET top boosted tokens (proxy for paid attention)
+    2) For each, fetch full pair data with volumes/liquidity/price-change
+    Returns: {symbol_upper: {volume metrics, liquidity, price_change, ...}}
     """
-    # Step 1: top boosted tokens
     boosts = safe_get(f"{DS_BASE}/token-boosts/top/v1")
     if not boosts or "_auth_error" in (boosts or {}):
         source_status["dexscreener"] = {
             "ok": False, "last_check": now_iso(),
-            "error": "boosts unreachable",
+            "error": "boosts unreachable", "count": 0,
         }
         return {}
 
-    # Boosts is a list of {chainId, tokenAddress, amount, totalAmount, ...}
     addresses = []
     if isinstance(boosts, list):
-        for b in boosts[:30]:  # top 30 boosted
+        for b in boosts[:30]:
             addr = b.get("tokenAddress")
             chain = b.get("chainId")
             if addr and chain:
                 addresses.append((chain, addr, b.get("totalAmount", 0)))
 
     out = {}
-    # Step 2: fetch pair data for each address
     for chain, addr, boost_amount in addresses[:25]:
         pair_data = safe_get(f"{DS_BASE}/latest/dex/tokens/{addr}", retries=1)
         if not pair_data or "pairs" not in pair_data:
@@ -297,7 +236,7 @@ def fetch_dexscreener_data() -> Dict[str, Dict]:
         if not pairs:
             continue
 
-        # Pick the pair with highest liquidity
+        # Pick highest-liquidity pair
         best = max(pairs, key=lambda p: float(
             (p.get("liquidity") or {}).get("usd") or 0
         ))
@@ -309,25 +248,21 @@ def fetch_dexscreener_data() -> Dict[str, Dict]:
 
         liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
         if liquidity < MIN_LIQUIDITY_USD:
-            continue  # filter rugs / dead tokens
+            continue  # filter rugs
 
-        # Volume metrics
         vol = best.get("volume", {}) or {}
         v_h1  = float(vol.get("h1") or 0)
         v_h6  = float(vol.get("h6") or 0)
         v_h24 = float(vol.get("h24") or 0)
 
-        # Volume surge: compare h1 to h6 average
         avg_h1_from_h6 = (v_h6 / 6.0) if v_h6 > 0 else 0
         vol_change_pct = ((v_h1 - avg_h1_from_h6) / avg_h1_from_h6 * 100) \
             if avg_h1_from_h6 > 0 else 0
 
-        # Price change
         pc = best.get("priceChange", {}) or {}
         price_change_h1  = float(pc.get("h1") or 0)
         price_change_h24 = float(pc.get("h24") or 0)
 
-        # Pair age
         created_at_ms = best.get("pairCreatedAt") or 0
         age_days = 0
         if created_at_ms:
@@ -350,156 +285,288 @@ def fetch_dexscreener_data() -> Dict[str, Dict]:
         }
 
     source_status["dexscreener"] = {
-        "ok": True, "last_check": now_iso(), "error": None
+        "ok": True, "last_check": now_iso(), "error": None, "count": len(out),
     }
-    log.info(f"[DS] {len(out)} tokens with volume data fetched")
+    log.info(f"[DS] {len(out)} tokens fetched")
     return out
 
 
-# ── ④ CryptoPanic News Buzz ──
-def fetch_cryptopanic_data() -> Dict[str, Dict]:
+# ── ② DefiLlama: TVL changes per protocol ──
+def fetch_defillama_data() -> Dict[str, Dict]:
     """
-    GET /posts/?filter=hot → hot news posts with currency tags.
-    Returns: {symbol_upper: {hot_count, votes_positive, votes_negative, sentiment_ratio}}
+    GET /protocols → all protocols with TVL + change_1h/1d/7d.
+    Aggregate by symbol (multi-protocol tokens like UNI sum across protocols).
+    Returns: {symbol_upper: {tvl, change_1d, change_7d, name, category, chains, ...}}
     """
-    if not CRYPTOPANIC_KEY:
-        source_status["cryptopanic"] = {
+    data = safe_get(f"{LLAMA_BASE}/protocols")
+    if not data or "_auth_error" in (data or {}):
+        source_status["defillama"] = {
             "ok": False, "last_check": now_iso(),
-            "error": "no API key (optional but recommended)",
+            "error": "unreachable", "count": 0,
         }
         return {}
 
-    data = safe_get(f"{CP_BASE}/posts/", params={
-        "auth_token": CRYPTOPANIC_KEY,
-        "filter": "hot",
-        "public": "true",
-    })
+    if not isinstance(data, list):
+        source_status["defillama"] = {
+            "ok": False, "last_check": now_iso(),
+            "error": "unexpected response", "count": 0,
+        }
+        return {}
+
+    # Aggregate by symbol — take the highest-TVL protocol per symbol
+    by_sym: Dict[str, Dict] = {}
+    for p in data:
+        sym = (p.get("symbol") or "").upper()
+        if not sym or sym == "-" or sym in BLACKLIST:
+            continue
+        tvl = float(p.get("tvl") or 0)
+        if tvl < 100_000:  # filter dust protocols
+            continue
+
+        existing = by_sym.get(sym)
+        if existing and existing["tvl"] >= tvl:
+            continue
+
+        by_sym[sym] = {
+            "name":        p.get("name", ""),
+            "tvl":         tvl,
+            "change_1h":   float(p.get("change_1h") or 0),
+            "change_1d":   float(p.get("change_1d") or 0),
+            "change_7d":   float(p.get("change_7d") or 0),
+            "category":    p.get("category", ""),
+            "chains":      p.get("chains") or [],
+            "url":         p.get("url", ""),
+            "twitter":     p.get("twitter", ""),
+            "mcap":        float(p.get("mcap") or 0),
+        }
+
+    source_status["defillama"] = {
+        "ok": True, "last_check": now_iso(), "error": None, "count": len(by_sym),
+    }
+    log.info(f"[LLAMA] {len(by_sym)} protocols with TVL fetched")
+    return by_sym
+
+
+# ── ③ LunarCrush: Galaxy Score (optional, with key) ──
+def fetch_lunarcrush_data() -> Dict[str, Dict]:
+    """
+    GET /coins/list/v2 → top 100 coins by Galaxy Score.
+    Returns: {symbol_upper: {galaxy_score, alt_rank, sentiment, ...}}
+    """
+    if not LUNARCRUSH_KEY:
+        source_status["lunarcrush"] = {
+            "ok": False, "last_check": now_iso(),
+            "error": "no API key (optional)", "count": 0,
+        }
+        return {}
+
+    headers = {"Authorization": f"Bearer {LUNARCRUSH_KEY}"}
+    data = safe_get(f"{LC_BASE}/coins/list/v2",
+                    params={"limit": 100, "sort": "galaxy_score"},
+                    headers=headers)
 
     if not data or "_auth_error" in (data or {}):
-        source_status["cryptopanic"] = {
+        source_status["lunarcrush"] = {
             "ok": False, "last_check": now_iso(),
-            "error": data.get("_text", "auth/unreachable") if data else "unreachable",
+            "error": data.get("_text", "auth/unreachable")[:80] if data else "unreachable",
+            "count": 0,
         }
         return {}
 
-    # Aggregate per symbol
-    agg: Dict[str, Dict] = defaultdict(lambda: {
-        "hot_count": 0,
-        "votes_positive": 0,
-        "votes_negative": 0,
-        "votes_important": 0,
-        "latest_title": "",
-        "latest_url": "",
-    })
-
-    posts = data.get("results", []) if isinstance(data, dict) else []
-    for post in posts[:50]:  # top 50 hot posts
-        currencies = post.get("currencies") or []
-        votes = post.get("votes") or {}
-        for cur in currencies:
-            sym = (cur.get("code") or "").upper()
-            if not sym or sym in BLACKLIST:
-                continue
-            agg[sym]["hot_count"] += 1
-            agg[sym]["votes_positive"] += int(votes.get("positive") or 0)
-            agg[sym]["votes_negative"] += int(votes.get("negative") or 0)
-            agg[sym]["votes_important"] += int(votes.get("important") or 0)
-            if not agg[sym]["latest_title"]:
-                agg[sym]["latest_title"] = post.get("title", "")[:120]
-                agg[sym]["latest_url"]   = post.get("url", "")
-
-    # Compute sentiment ratio (-1..+1)
     out = {}
-    for sym, d in agg.items():
-        pos, neg = d["votes_positive"], d["votes_negative"]
-        total = pos + neg
-        sentiment_ratio = ((pos - neg) / total) if total > 0 else 0.0
-        d["sentiment_ratio"] = sentiment_ratio
-        out[sym] = dict(d)
+    items = data.get("data", []) if isinstance(data, dict) else []
+    for c in items:
+        sym = (c.get("symbol") or "").upper()
+        if not sym or sym in BLACKLIST:
+            continue
+        out[sym] = {
+            "galaxy_score":      float(c.get("galaxy_score") or 0),
+            "alt_rank":          int(c.get("alt_rank") or 9999),
+            "social_volume_24h": float(c.get("interactions_24h") or 0),
+            "social_dominance":  float(c.get("social_dominance") or 0),
+            "sentiment":         float(c.get("sentiment") or 50),
+            "price":             float(c.get("price") or 0),
+            "percent_change_24h": float(c.get("percent_change_24h") or 0),
+        }
 
-    source_status["cryptopanic"] = {
-        "ok": True, "last_check": now_iso(), "error": None
+    source_status["lunarcrush"] = {
+        "ok": True, "last_check": now_iso(), "error": None, "count": len(out),
     }
-    log.info(f"[CP] {len(out)} symbols with hot news fetched")
+    log.info(f"[LC] {len(out)} coins with Galaxy Score fetched")
+    return out
+
+
+# ── ④ Binance Futures: 24h ticker (price, volume, OI signal) ──
+def fetch_binance_data() -> Dict[str, Dict]:
+    """
+    GET /fapi/v1/ticker/24hr → all USDT-perp tickers.
+    Computes per-symbol: price_change %, volume rank, volume vs market median.
+    Returns: {symbol_upper: {price_change_pct, quote_volume, volume_rank, ...}}
+    """
+    data = safe_get(f"{BIN_FAPI}/ticker/24hr", timeout=(5, 25))
+    if not data or "_auth_error" in (data or {}):
+        source_status["binance"] = {
+            "ok": False, "last_check": now_iso(),
+            "error": "unreachable (region?)", "count": 0,
+        }
+        return {}
+
+    if not isinstance(data, list):
+        source_status["binance"] = {
+            "ok": False, "last_check": now_iso(),
+            "error": "unexpected response", "count": 0,
+        }
+        return {}
+
+    # Filter USDT pairs only
+    usdt_pairs = []
+    for t in data:
+        sym_full = t.get("symbol", "")
+        if not sym_full.endswith("USDT"):
+            continue
+        try:
+            qv = float(t.get("quoteVolume") or 0)
+            pc = float(t.get("priceChangePercent") or 0)
+            lp = float(t.get("lastPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qv < MIN_BINANCE_VOL:
+            continue
+        usdt_pairs.append({
+            "symbol_full": sym_full,
+            "symbol":      normalize_sym(sym_full),
+            "quote_vol":   qv,
+            "price_chg":   pc,
+            "last_price":  lp,
+            "high":        float(t.get("highPrice") or 0),
+            "low":         float(t.get("lowPrice") or 0),
+            "trades":      int(t.get("count") or 0),
+        })
+
+    # Sort by volume to compute rank
+    usdt_pairs.sort(key=lambda x: x["quote_vol"], reverse=True)
+    total = len(usdt_pairs)
+
+    out = {}
+    for rank, p in enumerate(usdt_pairs, 1):
+        sym = p["symbol"]
+        if not sym or sym in BLACKLIST:
+            continue
+        out[sym] = {
+            "symbol_full":  p["symbol_full"],
+            "price_change_pct": p["price_chg"],
+            "quote_volume": p["quote_vol"],
+            "last_price":   p["last_price"],
+            "high":         p["high"],
+            "low":          p["low"],
+            "trades":       p["trades"],
+            "volume_rank":  rank,
+            "total_pairs":  total,
+        }
+
+    source_status["binance"] = {
+        "ok": True, "last_check": now_iso(), "error": None, "count": len(out),
+    }
+    log.info(f"[BIN] {len(out)} USDT-perp pairs fetched")
+    return out
+
+
+# ── ⑤ CoinPaprika: Top gainers + global market data ──
+def fetch_coinpaprika_data() -> Dict[str, Dict]:
+    """
+    GET /tickers → top 2000 coins by mcap with 24h % change.
+    Sort to identify top gainers.
+    Returns: {symbol_upper: {price, percent_change_24h, gainer_rank, mc_rank, ...}}
+    """
+    data = safe_get(f"{CP_BASE}/tickers", params={"limit": 2000},
+                    timeout=(5, 25))
+    if not data or "_auth_error" in (data or {}):
+        source_status["coinpaprika"] = {
+            "ok": False, "last_check": now_iso(),
+            "error": "unreachable", "count": 0,
+        }
+        return {}
+
+    if not isinstance(data, list):
+        source_status["coinpaprika"] = {
+            "ok": False, "last_check": now_iso(),
+            "error": "unexpected response", "count": 0,
+        }
+        return {}
+
+    # Extract relevant fields
+    coins = []
+    for c in data:
+        sym = (c.get("symbol") or "").upper()
+        if not sym or sym in BLACKLIST:
+            continue
+        usd = (c.get("quotes") or {}).get("USD") or {}
+        try:
+            pct_24h = float(usd.get("percent_change_24h") or 0)
+            price   = float(usd.get("price") or 0)
+            mc      = float(usd.get("market_cap") or 0)
+            vol_24h = float(usd.get("volume_24h") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mc < 1_000_000:  # dust filter
+            continue
+        coins.append({
+            "id":       c.get("id", ""),
+            "name":     c.get("name", ""),
+            "symbol":   sym,
+            "rank":     int(c.get("rank") or 9999),
+            "price":    price,
+            "pct_24h":  pct_24h,
+            "mcap":     mc,
+            "volume":   vol_24h,
+        })
+
+    # Sort by 24h % change (descending) for gainer rank
+    sorted_by_gain = sorted(coins, key=lambda x: x["pct_24h"], reverse=True)
+    gainer_rank_map = {c["symbol"]: idx + 1 for idx, c in enumerate(sorted_by_gain)}
+
+    out = {}
+    for c in coins:
+        out[c["symbol"]] = {
+            "id":            c["id"],
+            "name":          c["name"],
+            "price":         c["price"],
+            "percent_24h":   c["pct_24h"],
+            "mcap":          c["mcap"],
+            "volume_24h":    c["volume"],
+            "mc_rank":       c["rank"],
+            "gainer_rank":   gainer_rank_map.get(c["symbol"], 9999),
+        }
+
+    source_status["coinpaprika"] = {
+        "ok": True, "last_check": now_iso(), "error": None, "count": len(out),
+    }
+    log.info(f"[CP] {len(out)} coins fetched (sorted by gain)")
     return out
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. SOURCE SCORERS (each returns 0..max_weight*100 normalized)
+# 5. SOURCE SCORERS (each → 0..100 raw)
 # ══════════════════════════════════════════════════════════════════
-# Each scorer outputs 0..100 (raw), then aggregator multiplies by weight
-
-def score_coingecko(sym: str, cg_data: Dict[str, Dict]) -> float:
-    """
-    CG Trending rank → 0..100 score.
-    Rank 1 = 100 pts | Rank 15 = 30 pts | Not trending = 0
-    """
-    info = cg_data.get(sym)
-    if not info:
-        return 0.0
-    rank = info.get("rank", 16)
-    if rank > 15:
-        return 0.0
-    # Linear: rank 1 → 100 | rank 15 → 30
-    return max(0.0, 100.0 - ((rank - 1) * (70.0 / 14.0)))
-
-
-def score_lunarcrush(sym: str, lc_data: Dict[str, Dict]) -> float:
-    """
-    Galaxy Score (0-100) is a direct quality signal.
-    Boost for high social_dominance and bullish sentiment.
-    """
-    info = lc_data.get(sym)
-    if not info:
-        return 0.0
-
-    galaxy = info.get("galaxy_score", 0)            # 0-100
-    sentiment = info.get("sentiment", 50)           # 0-100
-    social_dom = info.get("social_dominance", 0)    # %
-    alt_rank = info.get("alt_rank", 9999)
-
-    # Base = Galaxy Score
-    score = galaxy
-
-    # Sentiment modifier: > 60 boosts up to +5, < 40 reduces up to -5
-    if sentiment > 60:
-        score += min(5.0, (sentiment - 60) / 8.0)
-    elif sentiment < 40:
-        score -= min(5.0, (40 - sentiment) / 8.0)
-
-    # Social dominance boost: > 1% = strong attention
-    if social_dom > 1.0:
-        score += min(5.0, social_dom * 2.0)
-
-    # AltRank top 50 boost
-    if alt_rank <= 50:
-        score += 5.0
-    elif alt_rank <= 100:
-        score += 2.0
-
-    return max(0.0, min(100.0, score))
-
 
 def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
     """
-    DEX volume surge is the strongest whale signal.
-    Volume change % h1-vs-avg: 100% = 50 | 500% = 80 | 1000%+ = 100
-    Plus liquidity & price-change confirmation.
+    Whale signal: on-chain volume surge + liquidity quality + price-vol agreement.
     """
     info = ds_data.get(sym)
     if not info:
         return 0.0
 
-    vol_change = info.get("vol_change_pct", 0)         # %
+    vol_change = info.get("vol_change_pct", 0)
     liquidity  = info.get("liquidity_usd", 0)
     price_h1   = info.get("price_change_h1", 0)
     price_h24  = info.get("price_change_h24", 0)
     boost      = info.get("boost_amount", 0)
     age_days   = info.get("age_days", 0)
 
-    # Base: volume surge (capped logarithmically)
+    # Base: volume surge
     if vol_change <= 0:
-        base = 20.0  # token is in boosted list = some attention
+        base = 20.0
     elif vol_change < 50:
         base = 30.0
     elif vol_change < 100:
@@ -513,31 +580,30 @@ def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
     else:
         base = 95.0
 
-    # Liquidity tier (whale concern: > $1M is healthy)
+    # Liquidity tier
     if liquidity >= 5_000_000:
         base += 3.0
     elif liquidity >= 1_000_000:
         base += 2.0
     elif liquidity < 250_000:
-        base -= 5.0  # low liquidity = manipulation risk
+        base -= 5.0
 
-    # Price-volume agreement: volume up + price up = real demand
+    # Price-volume agreement
     if vol_change > 100 and price_h1 > 5:
         base += 5.0
     elif vol_change > 100 and price_h1 < -5:
-        base -= 3.0   # volume spike but price dump = distribution
+        base -= 3.0
 
-    # 24h trend confirmation
     if price_h24 > 20:
         base += 2.0
 
-    # Boost amount (whales paying for visibility)
+    # Boost amount
     if boost >= 500:
         base += 3.0
     elif boost >= 100:
         base += 1.5
 
-    # Age penalty for very new tokens (rug risk)
+    # Age penalty (rug risk)
     if age_days < 7:
         base -= 8.0
     elif age_days < 30:
@@ -546,77 +612,232 @@ def score_dexscreener(sym: str, ds_data: Dict[str, Dict]) -> float:
     return max(0.0, min(100.0, base))
 
 
-def score_cryptopanic(sym: str, cp_data: Dict[str, Dict]) -> float:
+def score_defillama(sym: str, llama_data: Dict[str, Dict]) -> float:
     """
-    News buzz score: hot post count + sentiment + importance votes.
+    TVL change is the strongest institutional whale signal.
+    Whales position via DeFi protocols — TVL inflow precedes price.
     """
-    info = cp_data.get(sym)
+    info = llama_data.get(sym)
     if not info:
         return 0.0
 
-    hot_count       = info.get("hot_count", 0)
-    sentiment_ratio = info.get("sentiment_ratio", 0)    # -1..+1
-    important       = info.get("votes_important", 0)
+    tvl       = info.get("tvl", 0)
+    chg_1d    = info.get("change_1d", 0)
+    chg_7d    = info.get("change_7d", 0)
+    mcap      = info.get("mcap", 0)
 
-    # Base: hot count (capped at 10 posts)
-    if hot_count <= 0:
+    # Base: TVL change 1d
+    if chg_1d > 50:
+        base = 95.0
+    elif chg_1d > 25:
+        base = 85.0
+    elif chg_1d > 15:
+        base = 75.0
+    elif chg_1d > 8:
+        base = 65.0
+    elif chg_1d > 3:
+        base = 50.0
+    elif chg_1d > 0:
+        base = 35.0
+    elif chg_1d > -5:
+        base = 25.0
+    else:
+        base = 10.0
+
+    # 7d trend confirmation
+    if chg_7d > 30:
+        base += 5.0
+    elif chg_7d > 15:
+        base += 3.0
+    elif chg_7d < -20:
+        base -= 5.0
+
+    # TVL tier (size matters for quality)
+    if tvl >= 1_000_000_000:    # >$1B
+        base += 5.0
+    elif tvl >= 100_000_000:    # >$100M
+        base += 3.0
+    elif tvl >= 10_000_000:     # >$10M
+        base += 1.0
+    elif tvl < 1_000_000:       # <$1M = risky
+        base -= 5.0
+
+    return max(0.0, min(100.0, base))
+
+
+def score_lunarcrush(sym: str, lc_data: Dict[str, Dict]) -> float:
+    """Galaxy Score is a direct quality signal (when LC available)."""
+    info = lc_data.get(sym)
+    if not info:
         return 0.0
-    base = min(60.0, hot_count * 12.0)   # 1 post=12, 5 posts=60
 
-    # Sentiment modifier (-15..+25)
-    base += sentiment_ratio * 20.0
+    galaxy = info.get("galaxy_score", 0)
+    sentiment = info.get("sentiment", 50)
+    social_dom = info.get("social_dominance", 0)
+    alt_rank = info.get("alt_rank", 9999)
 
-    # Importance votes (whale-curated signal)
-    if important >= 10:
-        base += 15.0
-    elif important >= 5:
+    score = galaxy
+
+    if sentiment > 60:
+        score += min(5.0, (sentiment - 60) / 8.0)
+    elif sentiment < 40:
+        score -= min(5.0, (40 - sentiment) / 8.0)
+
+    if social_dom > 1.0:
+        score += min(5.0, social_dom * 2.0)
+
+    if alt_rank <= 50:
+        score += 5.0
+    elif alt_rank <= 100:
+        score += 2.0
+
+    return max(0.0, min(100.0, score))
+
+
+def score_binance(sym: str, bin_data: Dict[str, Dict]) -> float:
+    """
+    Binance Futures whale positioning: 24h price % + volume rank.
+    High volume + strong move = institutional flow.
+    """
+    info = bin_data.get(sym)
+    if not info:
+        return 0.0
+
+    price_chg = info.get("price_change_pct", 0)
+    qvol      = info.get("quote_volume", 0)
+    vol_rank  = info.get("volume_rank", 9999)
+    total     = info.get("total_pairs", 1)
+
+    # Base: 24h % change (absolute value matters — both pumps and dumps are signals)
+    abs_chg = abs(price_chg)
+    if abs_chg > 40:
+        base = 95.0
+    elif abs_chg > 25:
+        base = 85.0
+    elif abs_chg > 15:
+        base = 70.0
+    elif abs_chg > 8:
+        base = 55.0
+    elif abs_chg > 4:
+        base = 40.0
+    else:
+        base = 20.0
+
+    # Volume rank tier (top 10% of pairs = whale interest)
+    rank_pct = (vol_rank / total * 100) if total > 0 else 100
+    if rank_pct <= 5:
         base += 8.0
-    elif important >= 1:
+    elif rank_pct <= 10:
+        base += 5.0
+    elif rank_pct <= 25:
+        base += 2.0
+    elif rank_pct > 75:
+        base -= 5.0
+
+    # Direction signal (positive change preferred for hype)
+    if price_chg > 0:
+        base += 2.0
+
+    # Massive volume boost
+    if qvol >= 500_000_000:    # >$500M = top tier
+        base += 5.0
+    elif qvol >= 100_000_000:  # >$100M
         base += 3.0
 
     return max(0.0, min(100.0, base))
 
 
+def score_coinpaprika(sym: str, cp_data: Dict[str, Dict]) -> float:
+    """
+    CoinPaprika gainer rank: where does this coin sit in 24h gainers?
+    Top-N gainers = retail attention building.
+    """
+    info = cp_data.get(sym)
+    if not info:
+        return 0.0
+
+    pct_24h     = info.get("percent_24h", 0)
+    gainer_rank = info.get("gainer_rank", 9999)
+    mc_rank     = info.get("mc_rank", 9999)
+    mcap        = info.get("mcap", 0)
+
+    # Base: gainer rank
+    if gainer_rank <= 5:
+        base = 95.0
+    elif gainer_rank <= 10:
+        base = 85.0
+    elif gainer_rank <= 25:
+        base = 70.0
+    elif gainer_rank <= 50:
+        base = 55.0
+    elif gainer_rank <= 100:
+        base = 35.0
+    elif gainer_rank <= 250:
+        base = 20.0
+    else:
+        base = 10.0
+
+    # % change confirmation
+    if pct_24h < 2:
+        base *= 0.5  # gainer rank but tiny move = dead
+    elif pct_24h > 30:
+        base += 5.0
+
+    # MC tier
+    if mc_rank <= 50:
+        base += 3.0
+    elif mc_rank > 1000:
+        base -= 3.0
+
+    return max(0.0, min(100.0, base))
+
+
 # ══════════════════════════════════════════════════════════════════
-# 6. AGGREGATOR (combine 4 sources into unified score)
+# 6. AGGREGATOR (with dynamic weights)
 # ══════════════════════════════════════════════════════════════════
 
 def aggregate_hype_signals(
-    cg_data: Dict[str, Dict],
-    lc_data: Dict[str, Dict],
     ds_data: Dict[str, Dict],
+    llama_data: Dict[str, Dict],
+    lc_data: Dict[str, Dict],
+    bin_data: Dict[str, Dict],
     cp_data: Dict[str, Dict],
 ) -> List[Dict[str, Any]]:
     """
-    Combine all 4 sources for every unique symbol → ranked list.
-    Returns: [{symbol, score, sources_count, breakdown, ds_info, lc_info, ...}]
+    Combine 5 sources with dynamic weights → ranked list.
     """
-    # Collect all unique symbols across sources
+    weights = get_weights()
+
+    # All unique symbols
     all_syms = set()
-    all_syms.update(cg_data.keys())
-    all_syms.update(lc_data.keys())
     all_syms.update(ds_data.keys())
+    all_syms.update(llama_data.keys())
+    all_syms.update(lc_data.keys())
+    all_syms.update(bin_data.keys())
     all_syms.update(cp_data.keys())
 
     results = []
     for sym in all_syms:
-        s_cg = score_coingecko(sym, cg_data)
-        s_lc = score_lunarcrush(sym, lc_data)
-        s_ds = score_dexscreener(sym, ds_data)
-        s_cp = score_cryptopanic(sym, cp_data)
+        s_ds    = score_dexscreener(sym, ds_data)
+        s_llama = score_defillama(sym, llama_data)
+        s_lc    = score_lunarcrush(sym, lc_data)
+        s_bin   = score_binance(sym, bin_data)
+        s_cp    = score_coinpaprika(sym, cp_data)
 
-        # Count sources where score >= 30 (meaningful presence)
-        sources_count = sum(1 for s in (s_cg, s_lc, s_ds, s_cp) if s >= 30)
+        # Count meaningful sources (≥30 pts)
+        all_scores = [s_ds, s_llama, s_lc, s_bin, s_cp]
+        sources_count = sum(1 for s in all_scores if s >= 30)
 
         # Weighted unified score
         unified = (
-            s_cg * W_CG +
-            s_lc * W_LC +
-            s_ds * W_DEX +
-            s_cp * W_CP
+            s_ds    * weights["dexscreener"] +
+            s_llama * weights["defillama"] +
+            s_lc    * weights["lunarcrush"] +
+            s_bin   * weights["binance"] +
+            s_cp    * weights["coinpaprika"]
         )
 
-        if unified < 30:  # don't waste memory on weak signals
+        if unified < 30:
             continue
 
         results.append({
@@ -624,31 +845,28 @@ def aggregate_hype_signals(
             "score":          round(unified, 1),
             "sources_count":  sources_count,
             "breakdown": {
-                "coingecko":   round(s_cg, 1),
-                "lunarcrush":  round(s_lc, 1),
                 "dexscreener": round(s_ds, 1),
-                "cryptopanic": round(s_cp, 1),
+                "defillama":   round(s_llama, 1),
+                "lunarcrush":  round(s_lc, 1),
+                "binance":     round(s_bin, 1),
+                "coinpaprika": round(s_cp, 1),
             },
-            "cg_info": cg_data.get(sym, {}),
-            "lc_info": lc_data.get(sym, {}),
-            "ds_info": ds_data.get(sym, {}),
-            "cp_info": cp_data.get(sym, {}),
+            "ds_info":    ds_data.get(sym, {}),
+            "llama_info": llama_data.get(sym, {}),
+            "lc_info":    lc_data.get(sym, {}),
+            "bin_info":   bin_data.get(sym, {}),
+            "cp_info":    cp_data.get(sym, {}),
         })
 
-    # Sort by score descending
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. FILTERS (apply mode-specific rules)
+# 7. FILTERS
 # ══════════════════════════════════════════════════════════════════
 
 def passes_mode_filter(item: Dict[str, Any], mode: str) -> tuple:
-    """
-    Returns (passed: bool, reason: str)
-    Filters: min_score, min_sources, min_per_source.
-    """
     cfg = MODES.get(mode, MODES["عادي"])
 
     if item["score"] < cfg["min"]:
@@ -657,21 +875,17 @@ def passes_mode_filter(item: Dict[str, Any], mode: str) -> tuple:
     if item["sources_count"] < cfg["min_sources"]:
         return False, f"sources {item['sources_count']}/{cfg['min_sources']}"
 
-    # In stricter modes, every active source must clear the floor
     if cfg["min_per_source"] > 0:
-        active_scores = [
-            v for v in item["breakdown"].values() if v >= 30
-        ]
+        active_scores = [v for v in item["breakdown"].values() if v >= 30]
         if active_scores:
             min_active = min(active_scores)
             if min_active < cfg["min_per_source"]:
-                return False, f"weakest source {min_active} < {cfg['min_per_source']}"
+                return False, f"weakest {min_active} < {cfg['min_per_source']}"
 
     return True, "ok"
 
 
 def is_in_cooldown(symbol: str) -> bool:
-    """Check if symbol was alerted in last COOLDOWN_HOURS."""
     last_seen = seen_coins.get(symbol)
     if not last_seen:
         return False
@@ -706,93 +920,140 @@ def _src_emoji(score: float) -> str:
 
 
 def format_alert(item: Dict[str, Any], mode: str) -> str:
-    """Build the full alert message in Arabic Markdown."""
+    """Build Arabic alert in Markdown."""
     sym       = item["symbol"]
     score     = item["score"]
     sources   = item["sources_count"]
     bk        = item["breakdown"]
     ds        = item["ds_info"]
+    llama     = item["llama_info"]
     lc        = item["lc_info"]
-    cg        = item["cg_info"]
+    bin_i     = item["bin_info"]
     cp        = item["cp_info"]
 
+    weights = get_weights()
     grade = _grade_label(score)
+    has_lc = bool(LUNARCRUSH_KEY)
+
     lines = []
     lines.append(f"🔥 *إشارة HYPE* — `{sym}`")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"🎯 السكور الموحّد: *{score}/100* {grade}")
-    lines.append(f"📊 المصادر المتفقة: *{sources}/4*")
+    total_sources = 5 if has_lc else 4
+    lines.append(f"📊 المصادر المتفقة: *{sources}/{total_sources}*")
     lines.append("")
 
-    # Source breakdown
     lines.append("*التفصيل (whale-weighted):*")
+
+    # ① DexScreener
     if bk["dexscreener"] > 0:
+        w_pct = int(weights["dexscreener"] * 100)
         lines.append(
-            f"{_src_emoji(bk['dexscreener'])} DexScreener: `{bk['dexscreener']}/100`"
-            f" (وزن 35%)"
+            f"{_src_emoji(bk['dexscreener'])} DexScreener: `{bk['dexscreener']}/100` (وزن {w_pct}%)"
         )
         if ds:
-            vol_change = ds.get("vol_change_pct", 0)
-            liq        = ds.get("liquidity_usd", 0)
-            ph1        = ds.get("price_change_h1", 0)
-            chain      = ds.get("chain", "?")
+            vc = ds.get("vol_change_pct", 0)
+            liq = ds.get("liquidity_usd", 0)
+            ph1 = ds.get("price_change_h1", 0)
+            chain = ds.get("chain", "?")
             lines.append(
-                f"   💧 Volume +{vol_change:.0f}% | Liq ${liq/1000:.0f}K | "
+                f"   💧 Vol +{vc:.0f}% | Liq ${liq/1000:.0f}K | "
                 f"H1: {ph1:+.1f}% | {chain}"
             )
 
-    if bk["lunarcrush"] > 0:
+    # ② DefiLlama
+    if bk["defillama"] > 0:
+        w_pct = int(weights["defillama"] * 100)
         lines.append(
-            f"{_src_emoji(bk['lunarcrush'])} LunarCrush: `{bk['lunarcrush']}/100`"
-            f" (وزن 30%)"
+            f"{_src_emoji(bk['defillama'])} DefiLlama: `{bk['defillama']}/100` (وزن {w_pct}%)"
+        )
+        if llama:
+            tvl = llama.get("tvl", 0)
+            c1d = llama.get("change_1d", 0)
+            c7d = llama.get("change_7d", 0)
+            cat = llama.get("category", "?")
+            tvl_s = f"${tvl/1e9:.1f}B" if tvl >= 1e9 else f"${tvl/1e6:.1f}M"
+            lines.append(
+                f"   🦙 TVL: {tvl_s} | 1d: {c1d:+.1f}% | 7d: {c7d:+.1f}% | {cat}"
+            )
+
+    # ③ LunarCrush (only if available)
+    if has_lc and bk["lunarcrush"] > 0:
+        w_pct = int(weights["lunarcrush"] * 100)
+        lines.append(
+            f"{_src_emoji(bk['lunarcrush'])} LunarCrush: `{bk['lunarcrush']}/100` (وزن {w_pct}%)"
         )
         if lc:
             galaxy = lc.get("galaxy_score", 0)
             altrnk = lc.get("alt_rank", 0)
-            sent   = lc.get("sentiment", 0)
+            sent = lc.get("sentiment", 0)
             lines.append(
                 f"   🌌 Galaxy: {galaxy:.0f} | AltRank #{altrnk} | "
                 f"Sentiment: {sent:.0f}/100"
             )
 
-    if bk["cryptopanic"] > 0:
+    # ④ Binance Futures
+    if bk["binance"] > 0:
+        w_pct = int(weights["binance"] * 100)
         lines.append(
-            f"{_src_emoji(bk['cryptopanic'])} CryptoPanic: `{bk['cryptopanic']}/100`"
-            f" (وزن 20%)"
+            f"{_src_emoji(bk['binance'])} Binance: `{bk['binance']}/100` (وزن {w_pct}%)"
+        )
+        if bin_i:
+            pc = bin_i.get("price_change_pct", 0)
+            qv = bin_i.get("quote_volume", 0)
+            vr = bin_i.get("volume_rank", 0)
+            qv_s = f"${qv/1e9:.2f}B" if qv >= 1e9 else f"${qv/1e6:.1f}M"
+            lines.append(
+                f"   🐋 24h: {pc:+.2f}% | Vol: {qv_s} | Rank #{vr}"
+            )
+
+    # ⑤ CoinPaprika
+    if bk["coinpaprika"] > 0:
+        w_pct = int(weights["coinpaprika"] * 100)
+        lines.append(
+            f"{_src_emoji(bk['coinpaprika'])} CoinPaprika: `{bk['coinpaprika']}/100` (وزن {w_pct}%)"
         )
         if cp:
-            hot = cp.get("hot_count", 0)
-            ratio = cp.get("sentiment_ratio", 0)
-            sent_label = "إيجابي" if ratio > 0.2 else "سلبي" if ratio < -0.2 else "محايد"
-            lines.append(f"   📰 {hot} خبر حار | شعور: {sent_label}")
-
-    if bk["coingecko"] > 0:
-        lines.append(
-            f"{_src_emoji(bk['coingecko'])} CoinGecko: `{bk['coingecko']}/100`"
-            f" (وزن 15%)"
-        )
-        if cg:
-            rank = cg.get("rank", 0)
-            mc_rank = cg.get("market_cap_rank", 0)
-            lines.append(f"   📈 Trending #{rank} | MC Rank #{mc_rank}")
+            gr = cp.get("gainer_rank", 0)
+            mr = cp.get("mc_rank", 0)
+            p24 = cp.get("percent_24h", 0)
+            lines.append(
+                f"   📊 Gainer #{gr} | MC #{mr} | 24h: {p24:+.2f}%"
+            )
 
     lines.append("")
 
-    # Price summary if DEX data available
+    # Price summary (best source available)
+    price = 0
     if ds and ds.get("price_usd"):
-        price = ds.get("price_usd")
-        price_str = f"${price:.8f}".rstrip('0').rstrip('.') if price < 0.01 else f"${price:,.4f}"
+        price = ds["price_usd"]
+    elif bin_i and bin_i.get("last_price"):
+        price = bin_i["last_price"]
+    elif cp and cp.get("price"):
+        price = cp["price"]
+
+    if price > 0:
+        if price < 0.01:
+            price_str = f"${price:.8f}".rstrip('0').rstrip('.')
+        elif price < 1:
+            price_str = f"${price:.6f}".rstrip('0').rstrip('.')
+        else:
+            price_str = f"${price:,.4f}"
         lines.append(f"💰 السعر: `{price_str}`")
-        lines.append(f"📈 24س: {ds.get('price_change_h24', 0):+.2f}%")
+
+    if bin_i and bin_i.get("price_change_pct") is not None:
+        lines.append(f"📈 24س: {bin_i['price_change_pct']:+.2f}%")
+    elif cp and cp.get("percent_24h") is not None:
+        lines.append(f"📈 24س: {cp['percent_24h']:+.2f}%")
 
     lines.append("")
 
-    # Whale insight by mode
+    # Whale insight
     if score >= 92:
-        lines.append("🎯 *تحليل وول ستريت:* 4 مصادر متفقة بقوة. هذا نمط صفقة قنّاصة — "
+        lines.append("🎯 *تحليل وول ستريت:* 4+ مصادر متفقة بقوة. نمط صفقة قنّاصة — "
                     "الحيتان تتموضع. تحقّق يدوي قبل الدخول.")
     elif score >= 85:
-        lines.append("🎯 *تحليل وول ستريت:* منطقة دخول الحيتان. تأكد من DEX volume يستمر.")
+        lines.append("🎯 *تحليل وول ستريت:* منطقة دخول الحيتان. on-chain volume يدعم.")
     elif score >= 75:
         lines.append("🎯 *تحليل وول ستريت:* watchlist للمتداولين الكبار — مراقبة لا دخول.")
     else:
@@ -805,49 +1066,55 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
 
 
 def build_alert_buttons(item: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
-    """Inline buttons for chart links."""
+    """Inline buttons for chart links (5 sources)."""
     sym = item["symbol"]
     ds  = item.get("ds_info", {})
-    cg  = item.get("cg_info", {})
+    llama = item.get("llama_info", {})
+    bin_i = item.get("bin_info", {})
+    cp = item.get("cp_info", {})
 
     rows = []
-    btns = []
 
-    # Binance link (universal)
-    btns.append(InlineKeyboardButton(
-        "📊 Binance", url=f"https://www.binance.com/en/trade/{sym}_USDT"
-    ))
-
-    # DexScreener
-    if ds and ds.get("pair_url"):
-        btns.append(InlineKeyboardButton("💧 DexScreener", url=ds["pair_url"]))
-
-    rows.append(btns[:2])
-    btns2 = []
-
-    # CoinGecko
-    if cg and cg.get("cg_id"):
-        btns2.append(InlineKeyboardButton(
-            "📈 CoinGecko", url=f"https://www.coingecko.com/en/coins/{cg['cg_id']}"
+    # Row 1: Trading
+    btns1 = []
+    if bin_i and bin_i.get("symbol_full"):
+        btns1.append(InlineKeyboardButton(
+            "📊 Binance Fut", url=f"https://www.binance.com/en/futures/{bin_i['symbol_full']}"
         ))
+    else:
+        btns1.append(InlineKeyboardButton(
+            "📊 Binance", url=f"https://www.binance.com/en/trade/{sym}_USDT"
+        ))
+    if ds and ds.get("pair_url"):
+        btns1.append(InlineKeyboardButton("💧 DexScreener", url=ds["pair_url"]))
+    rows.append(btns1)
 
-    # LunarCrush
-    btns2.append(InlineKeyboardButton(
-        "🌌 LunarCrush", url=f"https://lunarcrush.com/coins/{sym.lower()}"
-    ))
-
+    # Row 2: Research
+    btns2 = []
+    if llama and llama.get("url"):
+        btns2.append(InlineKeyboardButton("🦙 DefiLlama", url=llama["url"]))
+    if cp and cp.get("id"):
+        btns2.append(InlineKeyboardButton(
+            "📊 CoinPaprika", url=f"https://coinpaprika.com/coin/{cp['id']}/"
+        ))
     if btns2:
         rows.append(btns2)
+
+    # Row 3: LunarCrush (if available)
+    if LUNARCRUSH_KEY:
+        rows.append([InlineKeyboardButton(
+            "🌌 LunarCrush", url=f"https://lunarcrush.com/coins/{sym.lower()}"
+        )])
 
     return InlineKeyboardMarkup(rows) if rows else None
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9. SCANNER JOB (periodic)
+# 9. SCANNER JOB
 # ══════════════════════════════════════════════════════════════════
 
 async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
-    """Main scanner: fetch all sources → aggregate → filter → alert."""
+    """Main periodic scanner: 5 sources → aggregate → filter → alert."""
     job_data = context.job.data or {}
     chat_id = job_data.get("chat_id")
     if not chat_id:
@@ -861,21 +1128,20 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
     log.info(f"[SCAN] start chat={chat_id} mode={mode}")
 
     try:
-        # Fetch all 4 sources (run in thread pool to avoid blocking)
         loop = asyncio.get_event_loop()
-        cg_data = await loop.run_in_executor(None, fetch_coingecko_trending)
-        lc_data = await loop.run_in_executor(None, fetch_lunarcrush_data)
-        ds_data = await loop.run_in_executor(None, fetch_dexscreener_data)
-        cp_data = await loop.run_in_executor(None, fetch_cryptopanic_data)
+        ds_data    = await loop.run_in_executor(None, fetch_dexscreener_data)
+        llama_data = await loop.run_in_executor(None, fetch_defillama_data)
+        lc_data    = await loop.run_in_executor(None, fetch_lunarcrush_data)
+        bin_data   = await loop.run_in_executor(None, fetch_binance_data)
+        cp_data    = await loop.run_in_executor(None, fetch_coinpaprika_data)
 
-        # Aggregate
-        aggregated = aggregate_hype_signals(cg_data, lc_data, ds_data, cp_data)
+        aggregated = aggregate_hype_signals(
+            ds_data, llama_data, lc_data, bin_data, cp_data
+        )
 
-        # Persist for `نتائج` and `top10` commands
         global last_results
         last_results = aggregated[:MAX_RESULTS_KEPT]
 
-        # Filter & alert
         sent_count = 0
         for item in aggregated:
             sym = item["symbol"]
@@ -887,7 +1153,6 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
             if is_in_cooldown(sym):
                 continue
 
-            # Send alert
             try:
                 msg = format_alert(item, mode)
                 buttons = build_alert_buttons(item)
@@ -921,79 +1186,117 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
 # 10. TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════
 
-START_MSG = (
-    "🔥 *HYPE\\_BOT v1\\.0* — Whale\\-Style Signal Scanner\n\n"
-    "أكشف العملات اللي عليها هايب من 4 مصادر مدمجة بأوزان احترافية\\.\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "*المصادر \\& الأوزان:*\n"
-    "💧 DexScreener   `35%`  on\\-chain volume \\(الأقوى\\)\n"
-    "🌌 LunarCrush    `30%`  Galaxy Score\n"
-    "📰 CryptoPanic   `20%`  News buzz\n"
-    "📈 CoinGecko     `15%`  Retail trending\n\n"
-    "*أوضاع الكشف \\(whale\\-style\\):*\n"
-    "🟢 `هايب`           ≥65  عادي\n"
-    "⚖️ `هايب متوازن`     ≥75  watchlist للحيتان\n"
-    "💎 `هايب جودة`       ≥85  منطقة دخول المحترفين\n"
-    "👑 `هايب ذهبي`       ≥92  صفقات قناصة \\(نادر\\)\n\n"
-    "*أوامر إضافية:*\n"
-    "`/test`     فحص اتصال المصادر\n"
-    "`حالة`      حالة المصادر الـ4\n"
-    "`نتائج`     آخر 5 إشارات\n"
-    "`top10`     أعلى 10 عملات هايب الآن\n"
-    "`وقف`       إيقاف الكشف\n\n"
-    "⚠️ _تنفيذ يدوي — تعليمي فقط، ليس نصيحة مالية_"
-)
+def _build_start_msg() -> str:
+    """Build /start message with current weights based on LC availability."""
+    w = get_weights()
+    lc_line = ""
+    if LUNARCRUSH_KEY:
+        lc_line = f"🌌 LunarCrush    `{int(w['lunarcrush']*100)}%`  Galaxy Score\n"
+    else:
+        lc_line = "🌌 LunarCrush    `معطّل`  (لا يوجد مفتاح)\n"
+
+    return (
+        "🔥 *HYPE\\_BOT v2\\.0* — Whale\\-Style Multi\\-Source Scanner\n\n"
+        "أكشف العملات اللي عليها هايب من 5 مصادر مدمجة\\.\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "*المصادر \\& الأوزان:*\n"
+        f"💧 DexScreener   `{int(w['dexscreener']*100)}%`  on\\-chain volume\n"
+        f"🦙 DefiLlama     `{int(w['defillama']*100)}%`  TVL change\n"
+        + lc_line.replace("%", "\\%").replace("(", "\\(").replace(")", "\\)").replace("-", "\\-").replace(".", "\\.").replace("`", "`") +
+        f"🐋 Binance Fut\\.  `{int(w['binance']*100)}%`  OI \\+ price action\n"
+        f"📊 CoinPaprika   `{int(w['coinpaprika']*100)}%`  top gainers\n\n"
+        "*أوضاع الكشف \\(whale\\-style\\):*\n"
+        "🟢 `هايب`           ≥65  عادي\n"
+        "⚖️ `هايب متوازن`     ≥75  watchlist\n"
+        "💎 `هايب جودة`       ≥85  دخول المحترفين\n"
+        "👑 `هايب ذهبي`       ≥92  قنّاصة \\(نادر\\)\n\n"
+        "*أوامر إضافية:*\n"
+        "`/test`     فحص اتصال المصادر\n"
+        "`حالة`      حالة المصادر الـ5\n"
+        "`نتائج`     آخر 10 إشارات\n"
+        "`top10`     أعلى 10 عملات هايب الآن\n"
+        "`سجل`       سجل التنبيهات\n"
+        "`وقف`       إيقاف الكشف\n\n"
+        "⚠️ _تنفيذ يدوي — تعليمي فقط، ليس نصيحة مالية_"
+    )
 
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text(START_MSG, parse_mode="MarkdownV2")
+    # Use simpler Markdown to avoid escape issues
+    w = get_weights()
+    lc_line = (f"🌌 LunarCrush     `{int(w['lunarcrush']*100)}%`  Galaxy Score"
+               if LUNARCRUSH_KEY else
+               "🌌 LunarCrush     `معطّل`  (لا يوجد مفتاح)")
+
+    msg = (
+        "🔥 *HYPE_BOT v2.0* — Whale-Style Scanner\n\n"
+        "كاشف الهايب من 5 مصادر مدمجة بأوزان احترافية.\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "*المصادر والأوزان:*\n"
+        f"💧 DexScreener    `{int(w['dexscreener']*100)}%`  on-chain volume\n"
+        f"🦙 DefiLlama      `{int(w['defillama']*100)}%`  TVL change\n"
+        f"{lc_line}\n"
+        f"🐋 Binance Fut.   `{int(w['binance']*100)}%`  OI + price\n"
+        f"📊 CoinPaprika    `{int(w['coinpaprika']*100)}%`  top gainers\n\n"
+        "*أوضاع الكشف:*\n"
+        "🟢 `هايب`          ≥65  عادي\n"
+        "⚖️ `هايب متوازن`    ≥75  watchlist\n"
+        "💎 `هايب جودة`      ≥85  دخول المحترفين\n"
+        "👑 `هايب ذهبي`      ≥92  قنّاصة (نادر)\n\n"
+        "*أوامر إضافية:*\n"
+        "`/test`     فحص اتصال المصادر\n"
+        "`حالة`      حالة المصادر الـ5\n"
+        "`نتائج`     آخر 10 إشارات\n"
+        "`top10`     أعلى 10 عملات هايب\n"
+        "`سجل`       سجل التنبيهات\n"
+        "`وقف`       إيقاف الكشف\n\n"
+        "⚠️ _تنفيذ يدوي — تعليمي فقط_"
+    )
+    await u.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Quick connectivity test to all 4 sources."""
-    msg = await u.message.reply_text("⏳ فحص المصادر الأربعة...")
+    """Connectivity test for 5 sources."""
+    msg = await u.message.reply_text("⏳ فحص المصادر الخمسة...")
 
     loop = asyncio.get_event_loop()
-    cg = await loop.run_in_executor(None, fetch_coingecko_trending)
-    lc = await loop.run_in_executor(None, fetch_lunarcrush_data)
-    ds = await loop.run_in_executor(None, fetch_dexscreener_data)
-    cp = await loop.run_in_executor(None, fetch_cryptopanic_data)
+    ds    = await loop.run_in_executor(None, fetch_dexscreener_data)
+    llama = await loop.run_in_executor(None, fetch_defillama_data)
+    lc    = await loop.run_in_executor(None, fetch_lunarcrush_data)
+    bin_d = await loop.run_in_executor(None, fetch_binance_data)
+    cp    = await loop.run_in_executor(None, fetch_coinpaprika_data)
 
-    def stat(d):
-        return d.get("ok", False)
-
-    lines = ["🔍 *نتيجة الفحص:*\n"]
     s = source_status
 
-    icon_cg = "✅" if stat(s["coingecko"])   else "❌"
-    icon_lc = "✅" if stat(s["lunarcrush"])  else "❌"
-    icon_ds = "✅" if stat(s["dexscreener"]) else "❌"
-    icon_cp = "✅" if stat(s["cryptopanic"]) else "❌"
+    def line(name: str, key: str, count_label: str) -> str:
+        info = s[key]
+        icon = "✅" if info.get("ok") else "❌"
+        cnt = info.get("count", 0)
+        out = f"{icon} *{name}*: {cnt} {count_label}"
+        err = info.get("error")
+        if err and not info.get("ok"):
+            out += f"\n   _{str(err)[:80]}_"
+        return out
 
-    lines.append(f"{icon_cg} *CoinGecko*: {len(cg)} عملة trending")
-    if not stat(s["coingecko"]):
-        lines.append(f"   _خطأ: {s['coingecko'].get('error', 'unknown')[:80]}_")
-
-    lines.append(f"{icon_lc} *LunarCrush*: {len(lc)} عملة بـ Galaxy Score")
-    if not stat(s["lunarcrush"]):
-        lines.append(f"   _ملاحظة: {s['lunarcrush'].get('error', '')[:80]}_")
-
-    lines.append(f"{icon_ds} *DexScreener*: {len(ds)} رمز بـ volume data")
-    if not stat(s["dexscreener"]):
-        lines.append(f"   _خطأ: {s['dexscreener'].get('error', '')[:80]}_")
-
-    lines.append(f"{icon_cp} *CryptoPanic*: {len(cp)} رمز بأخبار حارة")
-    if not stat(s["cryptopanic"]):
-        lines.append(f"   _ملاحظة: {s['cryptopanic'].get('error', '')[:80]}_")
-
-    active_count = sum(1 for x in (icon_cg, icon_lc, icon_ds, icon_cp) if x == "✅")
-    lines.append("")
-    if active_count >= 3:
-        lines.append(f"🎯 *الحالة:* ممتازة ({active_count}/4 مصادر شغّالة)")
-    elif active_count >= 2:
-        lines.append(f"⚠️ *الحالة:* مقبولة ({active_count}/4) — يفضّل تفعيل الباقي")
+    lines = ["🔍 *نتيجة الفحص:*\n"]
+    lines.append(line("DexScreener", "dexscreener", "رمز"))
+    lines.append(line("DefiLlama",   "defillama",   "بروتوكول"))
+    if LUNARCRUSH_KEY:
+        lines.append(line("LunarCrush", "lunarcrush", "عملة"))
     else:
-        lines.append(f"🚨 *الحالة:* ضعيفة ({active_count}/4) — تحقق من المفاتيح")
+        lines.append("⚪ *LunarCrush*: معطّل (لا يوجد مفتاح)")
+    lines.append(line("Binance",     "binance",     "زوج USDT"))
+    lines.append(line("CoinPaprika", "coinpaprika", "عملة"))
+
+    active_count = sum(1 for v in s.values() if v.get("ok"))
+    expected = 5 if LUNARCRUSH_KEY else 4
+    lines.append("")
+    if active_count >= expected - 1:
+        lines.append(f"🎯 *الحالة:* ممتازة ({active_count}/{expected})")
+    elif active_count >= expected // 2:
+        lines.append(f"⚠️ *الحالة:* مقبولة ({active_count}/{expected})")
+    else:
+        lines.append(f"🚨 *الحالة:* ضعيفة ({active_count}/{expected})")
 
     await msg.delete()
     await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -1009,9 +1312,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat_id = u.effective_chat.id
 
     # ── تفعيل الكشف ──
-    # "هايب" / "هايب متوازن" / "هايب جودة" / "هايب ذهبي"
     if text.startswith("هايب") or text_l in ("hype", "start hype"):
-        # parse mode
         mode = "عادي"
         if "متوازن" in text or "balance" in text_l:
             mode = "متوازن"
@@ -1027,28 +1328,28 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "min_score": cfg["min"],
         }
 
-        # Stop existing job for this chat
         for j in c.job_queue.get_jobs_by_name(f"hype_{chat_id}"):
             j.schedule_removal()
 
-        # Start new repeating job
         c.job_queue.run_repeating(
             scanner_job,
             interval=SCAN_INTERVAL_SEC,
-            first=10,    # first scan after 10 seconds
+            first=10,
             data={"chat_id": chat_id},
             name=f"hype_{chat_id}",
         )
+
+        sources_active = "5/5 مصادر" if LUNARCRUSH_KEY else "4/5 مصادر (LC معطّل)"
 
         await u.message.reply_text(
             f"🚨 *تم تفعيل كاشف الهايب*\n\n"
             f"⚙️ الوضع: {cfg['label']}\n"
             f"🎯 الحد الأدنى: `{cfg['min']}/100`\n"
-            f"📊 الحد الأدنى للمصادر: `{cfg['min_sources']}/4`\n"
+            f"📊 الحد الأدنى للمصادر: `{cfg['min_sources']}`\n"
+            f"📡 المصادر النشطة: `{sources_active}`\n"
             f"⏱ المسح: كل {SCAN_INTERVAL_SEC // 60} دقائق\n"
             f"❄️ Cooldown: ساعة واحدة لكل عملة\n\n"
-            f"⚠️ سيرسل تنبيهات للعملات بسكور موحّد ≥ {cfg['min']}\n"
-            f"⚠️ التنفيذ يدوي — تعليمي فقط\n\n"
+            f"⚠️ تنفيذ يدوي — تعليمي فقط\n"
             f"للإيقاف: `وقف`",
             parse_mode="Markdown"
         )
@@ -1065,14 +1366,20 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     # ── حالة المصادر ──
     if text_l in ("حالة", "status"):
         s = source_status
-        lines = ["📡 *حالة المصادر:*\n"]
-        for name, info in [
-            ("DexScreener", s["dexscreener"]),
-            ("LunarCrush",  s["lunarcrush"]),
-            ("CryptoPanic", s["cryptopanic"]),
-            ("CoinGecko",   s["coingecko"]),
-        ]:
+        lines = ["📡 *حالة المصادر الـ5:*\n"]
+
+        sources_order = [
+            ("💧 DexScreener", "dexscreener"),
+            ("🦙 DefiLlama",   "defillama"),
+            ("🌌 LunarCrush",  "lunarcrush"),
+            ("🐋 Binance",     "binance"),
+            ("📊 CoinPaprika", "coinpaprika"),
+        ]
+
+        for name, key in sources_order:
+            info = s[key]
             icon = "✅" if info.get("ok") else "❌"
+            cnt = info.get("count", 0)
             last = info.get("last_check", "—")
             if last and last != "—":
                 try:
@@ -1080,12 +1387,11 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     last = dt.strftime("%H:%M:%S")
                 except Exception:
                     pass
-            lines.append(f"{icon} *{name}*: {last}")
+            lines.append(f"{icon} *{name}*: {cnt} عنصر | {last}")
             err = info.get("error")
             if err and not info.get("ok"):
                 lines.append(f"   _{str(err)[:80]}_")
 
-        # Active scanner status
         cfg = chat_config.get(chat_id, {})
         lines.append("")
         if cfg.get("active"):
@@ -1096,17 +1402,24 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append("⚪ الكاشف متوقف")
 
-        # Cooldown info
-        active_cooldowns = sum(
-            1 for sym in seen_coins if is_in_cooldown(sym)
-        )
+        active_cooldowns = sum(1 for sym in seen_coins if is_in_cooldown(sym))
         lines.append(f"❄️ عملات في cooldown: {active_cooldowns}")
+
+        # Weights summary
+        w = get_weights()
+        lines.append("")
+        lines.append("⚖️ *الأوزان النشطة:*")
+        lines.append(
+            f"💧{int(w['dexscreener']*100)}% 🦙{int(w['defillama']*100)}% "
+            f"🌌{int(w['lunarcrush']*100)}% 🐋{int(w['binance']*100)}% "
+            f"📊{int(w['coinpaprika']*100)}%"
+        )
 
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
     # ── نتائج ──
-    if text_l in ("نتائج", "results", "آخر النتائج"):
+    if text_l in ("نتائج", "results"):
         if not last_results:
             await u.message.reply_text(
                 "⚪ لا توجد نتائج بعد.\nفعّل الكشف بـ: `هايب`",
@@ -1118,7 +1431,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             grade = _grade_label(item["score"])
             lines.append(
                 f"{i}. *{item['symbol']}* `{item['score']}/100` "
-                f"({item['sources_count']}/4) {grade}"
+                f"({item['sources_count']}/{5 if LUNARCRUSH_KEY else 4}) {grade}"
             )
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
@@ -1131,19 +1444,20 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-        lines = ["🏆 *أعلى 10 عملات هايب الآن:*\n"]
+        lines = ["🏆 *أعلى 10 عملات هايب:*\n"]
         for i, item in enumerate(last_results[:10], 1):
             bk = item["breakdown"]
+            lines.append(f"{i}. *{item['symbol']}* `{item['score']}/100`")
             lines.append(
-                f"{i}. *{item['symbol']}* `{item['score']}/100`\n"
-                f"   💧{bk['dexscreener']:.0f} 🌌{bk['lunarcrush']:.0f} "
-                f"📰{bk['cryptopanic']:.0f} 📈{bk['coingecko']:.0f}"
+                f"   💧{bk['dexscreener']:.0f} 🦙{bk['defillama']:.0f} "
+                f"🌌{bk['lunarcrush']:.0f} 🐋{bk['binance']:.0f} "
+                f"📊{bk['coinpaprika']:.0f}"
             )
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
-    # ── سجل التنبيهات ──
-    if text_l in ("سجل", "history", "الإشارات السابقة"):
+    # ── سجل ──
+    if text_l in ("سجل", "history"):
         if not alert_history:
             await u.message.reply_text("⚪ لم تُرسل أي تنبيهات بعد.")
             return
@@ -1154,14 +1468,11 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 t = dt.strftime("%H:%M")
             except Exception:
                 t = "—"
-            lines.append(
-                f"• `{t}` *{h['symbol']}* {h['score']}/100 "
-                f"({h['mode']})"
-            )
+            lines.append(f"• `{t}` *{h['symbol']}* {h['score']}/100 ({h['mode']})")
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
-    # ── help/unknown ──
+    # ── unknown ──
     await u.message.reply_text(
         "🤖 لم أفهم الأمر.\n\nأرسل `/start` لرؤية القائمة الكاملة.",
         parse_mode="Markdown"
@@ -1169,19 +1480,16 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update, context):
-    """Global error handler — log and continue."""
     log.warning(f"[ERR] {context.error}")
     try:
         if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "⚠️ خطأ مؤقت. حاول مرة أخرى."
-            )
+            await update.effective_message.reply_text("⚠️ خطأ مؤقت. حاول مرة أخرى.")
     except Exception:
         pass
 
 
 # ══════════════════════════════════════════════════════════════════
-# 11. POST INIT (delete webhook, prevent Conflict)
+# 11. POST INIT
 # ══════════════════════════════════════════════════════════════════
 
 async def _post_init(app):
@@ -1197,33 +1505,34 @@ async def _post_init(app):
 # ══════════════════════════════════════════════════════════════════
 
 def _print_banner():
-    cg_status = "✅" if COINGECKO_KEY   else "⚪ (بدون مفتاح، rate-limited)"
-    lc_status = "✅" if LUNARCRUSH_KEY  else "❌ (مفقود — مصدر معطّل)"
-    cp_status = "✅" if CRYPTOPANIC_KEY else "❌ (مفقود — مصدر معطّل)"
+    w = get_weights()
+    lc_status = (f"✅ مفعّل ({int(w['lunarcrush']*100)}%)"
+                 if LUNARCRUSH_KEY else "⚪ معطّل (لا يوجد مفتاح)")
 
-    print("=" * 65)
-    print("  🔥 HYPE_BOT v1.0 — Running ✅")
-    print("=" * 65)
-    print(f"  المصادر       : 4 (Whale-weighted)")
-    print(f"    💧 DexScreener  : ✅ (مجاني، بدون مفتاح)")
+    print("=" * 70)
+    print("  🔥 HYPE_BOT v2.0 — Running ✅")
+    print("=" * 70)
+    print(f"  المعمارية      : {'5 مصادر' if LUNARCRUSH_KEY else '4 مصادر'} (Whale-weighted)")
+    print(f"    💧 DexScreener  : ✅ مجاني ({int(w['dexscreener']*100)}%)")
+    print(f"    🦙 DefiLlama    : ✅ مجاني ({int(w['defillama']*100)}%)")
     print(f"    🌌 LunarCrush   : {lc_status}")
-    print(f"    📰 CryptoPanic  : {cp_status}")
-    print(f"    📈 CoinGecko    : {cg_status}")
-    print(f"  الأوضاع       : 4 (65 / 75 / 85 / 92)")
-    print(f"  المسح         : كل {SCAN_INTERVAL_SEC // 60} دقائق")
-    print(f"  Cooldown      : ساعة لكل عملة")
-    print(f"  السيولة الدنيا: ${MIN_LIQUIDITY_USD:,}")
-    print("=" * 65)
+    print(f"    🐋 Binance Fut. : ✅ مجاني ({int(w['binance']*100)}%)")
+    print(f"    📊 CoinPaprika  : ✅ مجاني ({int(w['coinpaprika']*100)}%)")
+    print(f"  الأوضاع         : 4 (65 / 75 / 85 / 92)")
+    print(f"  المسح           : كل {SCAN_INTERVAL_SEC // 60} دقائق")
+    print(f"  Cooldown        : ساعة لكل عملة")
+    print(f"  Min Liquidity   : ${MIN_LIQUIDITY_USD:,}")
+    print("=" * 70)
     print("  أرسل /start في تيليقرام لبدء الاستخدام")
-    print("=" * 65)
+    print("=" * 70)
 
 
 def main():
     if not BOT_TOKEN:
-        print("=" * 65)
+        print("=" * 70)
         print("  ❌ ERROR: BOT_TOKEN غير موجود في environment")
         print("  أضفه في Railway → Variables → BOT_TOKEN")
-        print("=" * 65)
+        print("=" * 70)
         return
 
     app = (
@@ -1233,7 +1542,6 @@ def main():
         .build()
     )
 
-    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(MessageHandler(
