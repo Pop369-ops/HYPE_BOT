@@ -1431,23 +1431,26 @@ async def cmd_esdebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_event_loop()
 
     def _test_chain(chainid: int, chain_name: str) -> dict:
-        """Light test: query gas price (free, fast)."""
+        """Light test: query block number (universal, works on all EVM chains)."""
         try:
             url = ETHERSCAN_BASE
             params = {
                 "chainid": chainid,
-                "module": "stats",
-                "action": "ethsupply2",
+                "module": "proxy",
+                "action": "eth_blockNumber",
                 "apikey": ETHERSCAN_KEY,
             }
             r = requests.get(url, params=params, timeout=10)
             body_preview = (r.text or "")[:160].replace("\n", " ")
+            # eth_blockNumber returns {"jsonrpc":"2.0","id":N,"result":"0x..."}
+            ok = (r.status_code == 200 and
+                  '"result":"0x' in (r.text or ""))
             return {
                 "chain": chain_name,
                 "chainid": chainid,
                 "status": str(r.status_code),
                 "body": body_preview,
-                "ok": r.status_code == 200 and '"status":"1"' in (r.text or ""),
+                "ok": ok,
             }
         except Exception as e:
             return {
