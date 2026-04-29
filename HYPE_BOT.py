@@ -2511,17 +2511,20 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     lines.append("")
     lines.append("*🤝 AI Council (Specialized):*")
     if GEMINI_API_KEY:
-        lines.append("🟢 Gemini (Quality): ✅ مفعّل · score ≥75")
+        key_len = len(GEMINI_API_KEY)
+        lines.append(f"🟢 Gemini (Quality): ✅ مفعّل · score ≥75 · `{key_len} chars`")
     else:
-        lines.append("🟢 Gemini (Quality): ⚪ معطّل (GEMINI_API_KEY)")
+        lines.append("🟢 Gemini (Quality): ⚪ معطّل (`GEMINI_API_KEY` فاضي)")
     if CLAUDE_API_KEY:
-        lines.append("🟣 Claude (Strategy): ✅ مفعّل · score ≥85")
+        key_len = len(CLAUDE_API_KEY)
+        lines.append(f"🟣 Claude (Strategy): ✅ مفعّل · score ≥85 · `{key_len} chars`")
     else:
-        lines.append("🟣 Claude (Strategy): ⚪ معطّل (CLAUDE_API_KEY)")
+        lines.append("🟣 Claude (Strategy): ⚪ معطّل (`CLAUDE_API_KEY` فاضي)")
     if OPENAI_API_KEY:
-        lines.append("🔵 OpenAI (Executor): ✅ مفعّل · score ≥92")
+        key_len = len(OPENAI_API_KEY)
+        lines.append(f"🔵 OpenAI (Executor): ✅ مفعّل · score ≥92 · `{key_len} chars`")
     else:
-        lines.append("🔵 OpenAI (Executor): ⚪ معطّل (OPENAI_API_KEY)")
+        lines.append("🔵 OpenAI (Executor): ⚪ معطّل (`OPENAI_API_KEY` فاضي)")
 
     # v4.0: Portfolio status
     lines.append("")
@@ -2864,6 +2867,138 @@ async def cmd_movers(u: Update, c: ContextTypes.DEFAULT_TYPE):
                                    parse_mode="Markdown")
 
 
+async def cmd_keydebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """v5.0: Deep diagnostic for AI keys (preview without exposing).
+
+    Helps identify:
+    - Empty keys
+    - Wrong variable names
+    - Whitespace issues
+    - Wrong format
+    """
+    lines = ["🔬 *AI Keys Deep Diagnostic*", ""]
+
+    keys_to_check = [
+        ("GEMINI_API_KEY", GEMINI_API_KEY, "AIza", 39),
+        ("CLAUDE_API_KEY", CLAUDE_API_KEY, "sk-ant-", 100),
+        ("OPENAI_API_KEY", OPENAI_API_KEY, "sk-", 50),
+        ("POLYGON_API_KEY", POLYGON_API_KEY, "", 32),
+        ("ETHERSCAN_KEY", ETHERSCAN_KEY, "", 34),
+    ]
+
+    for name, value, expected_prefix, min_len in keys_to_check:
+        if not value:
+            lines.append(f"❌ *{name}*: فاضي تماماً")
+            continue
+
+        actual_len = len(value)
+        # Show only safe preview (first 6 + last 4 chars)
+        if actual_len > 12:
+            preview = f"{value[:6]}...{value[-4:]}"
+        else:
+            preview = "***"
+
+        # Check format
+        has_prefix = (not expected_prefix) or value.startswith(expected_prefix)
+        len_ok = actual_len >= min_len
+
+        status = "✅" if (has_prefix and len_ok) else "⚠️"
+
+        lines.append(f"{status} *{name}*:")
+        lines.append(f"   📏 طول: `{actual_len}` chars (متوقع ≥{min_len})")
+        lines.append(f"   👁 معاينة: `{preview}`")
+        if expected_prefix and not has_prefix:
+            lines.append(f"   ⚠️ يجب أن يبدأ بـ `{expected_prefix}`")
+        if not len_ok:
+            lines.append(f"   ⚠️ الطول قصير جداً")
+
+    # Test live connectivity
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("*اختبار الاتصال:*")
+
+    # Test Gemini if key exists
+    if GEMINI_API_KEY:
+        try:
+            url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
+            headers = {"Content-Type": "application/json",
+                       "x-goog-api-key": GEMINI_API_KEY}
+            body = {
+                "contents": [{"parts": [{"text": "Reply with JSON: {\"ok\":true}"}]}],
+                "generationConfig": {"temperature": 0, "maxOutputTokens": 50},
+            }
+            r = requests.post(url, headers=headers, json=body, timeout=(5, 15))
+            if r.status_code == 200:
+                lines.append(f"✅ Gemini live test: PASS ({r.elapsed.total_seconds()*1000:.0f}ms)")
+            elif r.status_code in (401, 403):
+                lines.append(f"❌ Gemini: مفتاح غير صحيح (HTTP {r.status_code})")
+            elif r.status_code == 429:
+                lines.append("⏱ Gemini: rate limit (try again later)")
+            else:
+                err = r.text[:80]
+                lines.append(f"❌ Gemini: HTTP {r.status_code}")
+                lines.append(f"   _{err}_")
+        except Exception as e:
+            lines.append(f"❌ Gemini: {type(e).__name__}: {str(e)[:60]}")
+    else:
+        lines.append("⏭ Gemini: تم تخطي (المفتاح فاضي)")
+
+    # Test Claude
+    if CLAUDE_API_KEY:
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+            }
+            body = {
+                "model": CLAUDE_MODEL,
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "say ok"}],
+            }
+            r = requests.post(CLAUDE_BASE, headers=headers, json=body, timeout=(5, 20))
+            if r.status_code == 200:
+                lines.append(f"✅ Claude live test: PASS ({r.elapsed.total_seconds()*1000:.0f}ms)")
+            elif r.status_code in (401, 403):
+                lines.append(f"❌ Claude: مفتاح غير صحيح (HTTP {r.status_code})")
+            else:
+                err = r.text[:80]
+                lines.append(f"❌ Claude: HTTP {r.status_code}")
+                lines.append(f"   _{err}_")
+        except Exception as e:
+            lines.append(f"❌ Claude: {type(e).__name__}: {str(e)[:60]}")
+    else:
+        lines.append("⏭ Claude: تم تخطي")
+
+    # Test OpenAI
+    if OPENAI_API_KEY:
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            }
+            body = {
+                "model": OPENAI_MODEL,
+                "messages": [{"role": "user", "content": "say ok"}],
+                "max_tokens": 10,
+            }
+            r = requests.post(OPENAI_BASE, headers=headers, json=body, timeout=(5, 20))
+            if r.status_code == 200:
+                lines.append(f"✅ OpenAI live test: PASS ({r.elapsed.total_seconds()*1000:.0f}ms)")
+            elif r.status_code in (401, 403):
+                lines.append(f"❌ OpenAI: مفتاح غير صحيح (HTTP {r.status_code})")
+            else:
+                err = r.text[:80]
+                lines.append(f"❌ OpenAI: HTTP {r.status_code}")
+                lines.append(f"   _{err}_")
+        except Exception as e:
+            lines.append(f"❌ OpenAI: {type(e).__name__}: {str(e)[:60]}")
+    else:
+        lines.append("⏭ OpenAI: تم تخطي")
+
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.message.text:
         return
@@ -3115,6 +3250,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("esdebug", cmd_esdebug))
+    app.add_handler(CommandHandler("keydebug", cmd_keydebug))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("movers", cmd_movers))
     app.add_handler(MessageHandler(
