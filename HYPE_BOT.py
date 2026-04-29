@@ -43,12 +43,30 @@ log = logging.getLogger("HYPE_BOT")
 
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "").strip()
 ETHERSCAN_KEY  = os.environ.get("ETHERSCAN_KEY", "").strip()
+# v4.0 additions:
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip()  # Massive.com
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
+CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "").strip()   # v5.0
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "").strip()   # v5.0
+DCA_DATA_DIR    = os.environ.get("DCA_DATA_DIR", "/data").strip()
 
 DS_BASE         = "https://api.dexscreener.com"
 LLAMA_BASE      = "https://api.llama.fi"
 BIN_FAPI        = "https://fapi.binance.com/fapi/v1"
 CP_BASE         = "https://api.coinpaprika.com/v1"
 ETHERSCAN_BASE  = "https://api.etherscan.io/v2/api"
+# v4.0 — Massive.com (Polygon.io rebrand) cross-exchange data
+MASSIVE_BASE    = "https://api.polygon.io"
+# v4.0 — Gemini AI
+GEMINI_BASE     = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODEL    = "gemini-2.5-flash"
+# v5.0 — Specialized AI Council
+CLAUDE_BASE     = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL    = "claude-opus-4-5"
+CLAUDE_FALLBACK = "claude-sonnet-4-5"
+OPENAI_BASE     = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL    = "gpt-4o"
+OPENAI_FALLBACK = "gpt-4o-mini"
 
 CHAIN_ID_MAP = {
     "ethereum":  1,    "eth":       1,    "mainnet":   1,
@@ -72,6 +90,7 @@ def get_chain_id(chain: str) -> int:
     return CHAIN_ID_MAP.get((chain or "").lower().strip(), 0)
 
 
+# v3.0 — 5 sources (legacy weights)
 W_5SRC = {
     "dexscreener": 0.35,
     "defillama":   0.20,
@@ -88,8 +107,43 @@ W_4SRC = {
     "coinpaprika": 0.12,
 }
 
+# v4.0 — 6 sources with Massive (cross-exchange aggregated)
+# Reduced other weights proportionally to add Massive
+W_6SRC_EVM = {
+    "dexscreener": 0.30,  # was 35
+    "defillama":   0.18,  # was 20
+    "etherscan":   0.18,  # was 20
+    "binance":     0.12,  # was 15
+    "coinpaprika": 0.07,  # was 10
+    "massive":     0.15,  # NEW! cross-exchange
+}
+
+W_6SRC_NONEVM = {
+    "dexscreener": 0.40,  # was 45
+    "defillama":   0.22,  # was 25
+    "etherscan":   0.00,
+    "binance":     0.15,  # was 18
+    "coinpaprika": 0.08,  # was 12
+    "massive":     0.15,  # NEW!
+}
+
 
 def get_weights_for_chain(chain: str) -> Dict[str, float]:
+    """
+    Determines weight distribution based on:
+    - EVM vs non-EVM chain
+    - Whether Etherscan key exists
+    - Whether Massive (Polygon) key exists
+    """
+    has_es = bool(ETHERSCAN_KEY)
+    has_massive = bool(POLYGON_API_KEY)
+
+    if has_massive:
+        if has_es and is_evm_chain(chain):
+            return W_6SRC_EVM
+        return W_6SRC_NONEVM
+
+    # Fallback to v3.0 weights (no Massive)
     if not ETHERSCAN_KEY:
         return W_4SRC
     if is_evm_chain(chain):
@@ -139,6 +193,7 @@ source_status: Dict[str, Dict[str, Any]] = {
     "etherscan":   {"ok": False, "last_check": None, "error": None, "count": 0},
     "binance":     {"ok": False, "last_check": None, "error": None, "count": 0},
     "coinpaprika": {"ok": False, "last_check": None, "error": None, "count": 0},
+    "massive":     {"ok": False, "last_check": None, "error": None, "count": 0},
 }
 
 alert_history: List[Dict[str, Any]] = []
@@ -646,6 +701,209 @@ def fetch_coinpaprika_data() -> Dict[str, Dict]:
 
 
 # ══════════════════════════════════════════════════════════════════
+# 4.6 MASSIVE.COM (POLYGON.IO) — Cross-Exchange Aggregated Data (v4.0)
+# ══════════════════════════════════════════════════════════════════
+# Massive.com rebranded from Polygon.io in Oct 2025.
+# API endpoints still live at api.polygon.io.
+# Plan: Currencies Starter ($49/mo) — All Crypto + Trades + Unlimited.
+
+# Massive uses USD as quote currency, format: X:{from}{to}
+_MASSIVE_SYMBOLS = {
+    "BTC":   "X:BTCUSD",   "ETH":  "X:ETHUSD",   "SOL":  "X:SOLUSD",
+    "BNB":   "X:BNBUSD",   "XRP":  "X:XRPUSD",   "ADA":  "X:ADAUSD",
+    "DOGE":  "X:DOGEUSD",  "AVAX": "X:AVAXUSD",  "DOT":  "X:DOTUSD",
+    "MATIC": "X:MATICUSD", "LINK": "X:LINKUSD",  "UNI":  "X:UNIUSD",
+    "AAVE":  "X:AAVEUSD",  "ATOM": "X:ATOMUSD",  "NEAR": "X:NEARUSD",
+    "HBAR":  "X:HBARUSD",  "ARB":  "X:ARBUSD",   "OP":   "X:OPUSD",
+    "PEPE":  "X:PEPEUSD",  "SHIB": "X:SHIBUSD",  "WIF":  "X:WIFUSD",
+    "BONK":  "X:BONKUSD",  "ONDO": "X:ONDOUSD",  "PYTH": "X:PYTHUSD",
+    "RENDER":"X:RENDERUSD","TAO":  "X:TAOUSD",   "FET":  "X:FETUSD",
+    "HYPE":  "X:HYPEUSD",  "SUI":  "X:SUIUSD",   "APT":  "X:APTUSD",
+    "INJ":   "X:INJUSD",   "SEI":  "X:SEIUSD",   "TIA":  "X:TIAUSD",
+    "JUP":   "X:JUPUSD",   "ENS":  "X:ENSUSD",   "MKR":  "X:MKRUSD",
+    "LDO":   "X:LDOUSD",   "GRT":  "X:GRTUSD",   "FIL":  "X:FILUSD",
+    "LTC":   "X:LTCUSD",   "BCH":  "X:BCHUSD",   "TRX":  "X:TRXUSD",
+}
+
+
+def _massive_request(path: str, params: Optional[Dict] = None,
+                     timeout=(5, 12)) -> Optional[Dict]:
+    """Generic Massive API request with auth. Returns parsed JSON or None."""
+    if not POLYGON_API_KEY:
+        return None
+    p = dict(params or {})
+    p["apiKey"] = POLYGON_API_KEY
+    try:
+        r = requests.get(MASSIVE_BASE + path, params=p, timeout=timeout)
+        if r.status_code != 200:
+            log.debug(f"[MASSIVE] {path} HTTP {r.status_code}")
+            return None
+        return r.json()
+    except Exception as e:
+        log.debug(f"[MASSIVE] {path} failed: {e}")
+        return None
+
+
+def fetch_massive_data() -> Dict[str, Dict]:
+    """
+    Fetch top movers + snapshots from Massive (cross-exchange aggregated).
+    Returns: {symbol: {price, change_24h, volume_24h, momentum_score}}
+    """
+    if not POLYGON_API_KEY:
+        source_status["massive"]["ok"] = False
+        source_status["massive"]["error"] = "no key"
+        return {}
+
+    out = {}
+
+    # Strategy 1: Get snapshot of all crypto tickers (single API call)
+    snapshot = _massive_request(
+        "/v2/snapshot/locale/global/markets/crypto/tickers"
+    )
+
+    if not snapshot or "tickers" not in snapshot:
+        log.info("[MASSIVE] snapshot failed, trying individual symbols")
+        out = _fetch_massive_individual()
+    else:
+        tickers = snapshot.get("tickers", [])
+        log.info(f"[MASSIVE] snapshot: {len(tickers)} crypto tickers")
+
+        rev_map = {v: k for k, v in _MASSIVE_SYMBOLS.items()}
+
+        for t in tickers:
+            ticker = t.get("ticker", "")
+            if ticker not in rev_map:
+                continue
+
+            our_sym = rev_map[ticker]
+            day = t.get("day", {}) or {}
+            prev_day = t.get("prevDay", {}) or {}
+            last_trade = t.get("lastTrade", {}) or {}
+
+            price = float(last_trade.get("p") or day.get("c") or 0)
+            prev_close = float(prev_day.get("c") or 0)
+
+            if price <= 0:
+                continue
+
+            if prev_close > 0:
+                change_24h = ((price - prev_close) / prev_close) * 100
+            else:
+                change_24h = float(t.get("todaysChangePerc", 0))
+
+            volume_24h = float(day.get("v", 0)) * price
+            high_24h = float(day.get("h", 0))
+            low_24h = float(day.get("l", 0))
+
+            # Massive momentum score (0-100)
+            momentum = 50.0
+            if change_24h >= 10:
+                momentum += 25
+            elif change_24h >= 5:
+                momentum += 15
+            elif change_24h >= 2:
+                momentum += 8
+            elif change_24h <= -10:
+                momentum -= 25
+            elif change_24h <= -5:
+                momentum -= 15
+
+            prev_volume = float(prev_day.get("v", 0)) * prev_close
+            if prev_volume > 0:
+                vol_ratio = volume_24h / prev_volume
+                if vol_ratio >= 3:
+                    momentum += 15
+                elif vol_ratio >= 2:
+                    momentum += 10
+                elif vol_ratio >= 1.5:
+                    momentum += 5
+
+            momentum = max(0, min(100, momentum))
+
+            out[our_sym] = {
+                "price":         price,
+                "change_24h":    change_24h,
+                "volume_24h":    volume_24h,
+                "high_24h":      high_24h,
+                "low_24h":       low_24h,
+                "momentum_score": momentum,
+                "source":        "massive",
+            }
+
+    # Update source status
+    source_status["massive"]["ok"] = len(out) > 0
+    source_status["massive"]["last_check"] = now_iso()
+    source_status["massive"]["count"] = len(out)
+    source_status["massive"]["error"] = None if out else "no data returned"
+
+    log.info(f"[MASSIVE] mapped {len(out)} symbols")
+    return out
+
+
+def _fetch_massive_individual() -> Dict[str, Dict]:
+    """Fallback: fetch each symbol individually (slower)."""
+    out = {}
+    # Limit to top tracked symbols to avoid rate limit
+    priority_symbols = ["BTC", "ETH", "SOL", "HYPE", "ONDO", "RENDER", "AAVE",
+                        "LINK", "PYTH", "SUI", "TAO", "AVAX", "NEAR", "DOT"]
+    for sym in priority_symbols:
+        massive_sym = _MASSIVE_SYMBOLS.get(sym)
+        if not massive_sym:
+            continue
+        data = _massive_request(
+            f"/v2/snapshot/locale/global/markets/crypto/tickers/{massive_sym}"
+        )
+        if not data or "ticker" not in data:
+            continue
+        t = data["ticker"]
+        day = t.get("day", {}) or {}
+        prev_day = t.get("prevDay", {}) or {}
+        last_trade = t.get("lastTrade", {}) or {}
+
+        price = float(last_trade.get("p") or day.get("c") or 0)
+        if price <= 0:
+            continue
+
+        change_24h = float(t.get("todaysChangePerc", 0))
+        out[sym] = {
+            "price":         price,
+            "change_24h":    change_24h,
+            "volume_24h":    float(day.get("v", 0)) * price,
+            "high_24h":      float(day.get("h", 0)),
+            "low_24h":       float(day.get("l", 0)),
+            "momentum_score": 50 + min(25, change_24h * 2),
+            "source":        "massive",
+        }
+        time.sleep(0.1)
+    return out
+
+
+def massive_get_top_movers(limit: int = 10) -> List[Dict]:
+    """Get top gainers from Massive (24h % change)."""
+    if not POLYGON_API_KEY:
+        return []
+    data = _massive_request(
+        "/v2/snapshot/locale/global/markets/crypto/gainers",
+        {"include_otc": "false"}
+    )
+    if not data or "tickers" not in data:
+        return []
+
+    rev_map = {v: k for k, v in _MASSIVE_SYMBOLS.items()}
+    movers = []
+    for t in data["tickers"][:limit]:
+        ticker = t.get("ticker", "")
+        sym = rev_map.get(ticker, ticker.replace("X:", "").replace("USD", ""))
+        movers.append({
+            "symbol":     sym,
+            "ticker":     ticker,
+            "change_pct": float(t.get("todaysChangePerc", 0)),
+            "price":      float(t.get("lastTrade", {}).get("p", 0)),
+        })
+    return movers
+
+
+# ══════════════════════════════════════════════════════════════════
 # 5. SOURCE SCORERS (each → 0..100)
 # ══════════════════════════════════════════════════════════════════
 
@@ -891,6 +1149,17 @@ def score_coinpaprika(sym: str, cp_data: Dict[str, Dict]) -> float:
     return max(0.0, min(100.0, base))
 
 
+def score_massive(sym: str, massive_data: Dict[str, Dict]) -> float:
+    """
+    Score from Massive (cross-exchange aggregated data).
+    Already pre-computed in fetch_massive_data.
+    """
+    info = massive_data.get(sym)
+    if not info:
+        return 0.0
+    return float(info.get("momentum_score", 0))
+
+
 # ══════════════════════════════════════════════════════════════════
 # 6. AGGREGATOR (chain-aware dynamic weights)
 # ══════════════════════════════════════════════════════════════════
@@ -901,8 +1170,12 @@ def aggregate_hype_signals(
     es_data: Dict[str, Dict],
     bin_data: Dict[str, Dict],
     cp_data: Dict[str, Dict],
+    massive_data: Optional[Dict[str, Dict]] = None,
 ) -> List[Dict[str, Any]]:
-    """Combine 5 sources with chain-aware weights → ranked list."""
+    """Combine 5-6 sources with chain-aware weights → ranked list."""
+
+    if massive_data is None:
+        massive_data = {}
 
     all_syms = set()
     all_syms.update(ds_data.keys())
@@ -910,14 +1183,16 @@ def aggregate_hype_signals(
     all_syms.update(es_data.keys())
     all_syms.update(bin_data.keys())
     all_syms.update(cp_data.keys())
+    all_syms.update(massive_data.keys())
 
     results = []
     for sym in all_syms:
-        s_ds    = score_dexscreener(sym, ds_data)
-        s_llama = score_defillama(sym, llama_data)
-        s_es    = score_etherscan(sym, es_data)
-        s_bin   = score_binance(sym, bin_data)
-        s_cp    = score_coinpaprika(sym, cp_data)
+        s_ds      = score_dexscreener(sym, ds_data)
+        s_llama   = score_defillama(sym, llama_data)
+        s_es      = score_etherscan(sym, es_data)
+        s_bin     = score_binance(sym, bin_data)
+        s_cp      = score_coinpaprika(sym, cp_data)
+        s_massive = score_massive(sym, massive_data)
 
         # Determine chain context for weight selection
         ds_info = ds_data.get(sym, {})
@@ -926,15 +1201,17 @@ def aggregate_hype_signals(
 
         weights = get_weights_for_chain(chain)
 
-        all_scores = [s_ds, s_llama, s_es, s_bin, s_cp]
+        all_scores = [s_ds, s_llama, s_es, s_bin, s_cp, s_massive]
         sources_count = sum(1 for s in all_scores if s >= 30)
 
+        # Compute unified score (weights["massive"] is 0 if no key)
         unified = (
-            s_ds    * weights["dexscreener"] +
-            s_llama * weights["defillama"] +
-            s_es    * weights["etherscan"] +
-            s_bin   * weights["binance"] +
-            s_cp    * weights["coinpaprika"]
+            s_ds      * weights["dexscreener"] +
+            s_llama   * weights["defillama"] +
+            s_es      * weights["etherscan"] +
+            s_bin     * weights["binance"] +
+            s_cp      * weights["coinpaprika"] +
+            s_massive * weights.get("massive", 0)
         )
 
         if unified < 30:
@@ -953,16 +1230,577 @@ def aggregate_hype_signals(
                 "etherscan":   round(s_es, 1),
                 "binance":     round(s_bin, 1),
                 "coinpaprika": round(s_cp, 1),
+                "massive":     round(s_massive, 1),
             },
-            "ds_info":    ds_data.get(sym, {}),
-            "llama_info": llama_data.get(sym, {}),
-            "es_info":    es_data.get(sym, {}),
-            "bin_info":   bin_data.get(sym, {}),
-            "cp_info":    cp_data.get(sym, {}),
+            "ds_info":      ds_data.get(sym, {}),
+            "llama_info":   llama_data.get(sym, {}),
+            "es_info":      es_data.get(sym, {}),
+            "bin_info":     bin_data.get(sym, {}),
+            "cp_info":      cp_data.get(sym, {}),
+            "massive_info": massive_data.get(sym, {}),
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
+
+
+# ══════════════════════════════════════════════════════════════════
+# 6.5 AI LAYER — Gemini Hype Quality Analysis (v4.0)
+# ══════════════════════════════════════════════════════════════════
+# Gemini analyzes each high-grade hype signal to determine:
+# - Is the hype ORGANIC or PUMPED?
+# - Risk level
+# - Hold/Sell/Avoid recommendation
+import json
+import re
+
+def gemini_analyze_hype(item: Dict[str, Any]) -> Optional[Dict]:
+    """
+    Analyze hype signal with Gemini AI.
+    Returns: {quality, risk, recommendation_ar, reasoning_ar} or None
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    sym = item.get("symbol", "")
+    score = item.get("score", 0)
+    breakdown = item.get("breakdown", {})
+    ds_info = item.get("ds_info", {})
+    llama_info = item.get("llama_info", {})
+    es_info = item.get("es_info", {})
+    massive_info = item.get("massive_info", {})
+
+    # Build context for AI
+    context = []
+    context.append(f"Symbol: {sym}")
+    context.append(f"Total hype score: {score}/100")
+    context.append(f"Chain: {ds_info.get('chain', 'unknown')}")
+
+    # Source scores
+    context.append("\nSource breakdown:")
+    for src, val in breakdown.items():
+        if val > 0:
+            context.append(f"  - {src}: {val}/100")
+
+    # Critical metrics
+    if ds_info:
+        context.append(f"\nDEX volume 24h: ${ds_info.get('volume_24h', 0):,.0f}")
+        context.append(f"DEX price change 24h: {ds_info.get('price_change_24h', 0):.1f}%")
+        context.append(f"Liquidity: ${ds_info.get('liquidity', 0):,.0f}")
+
+    if es_info:
+        context.append(f"\nWhale tx (1h, ≥$10K): {es_info.get('whale_tx_count', 0)}")
+        context.append(f"Velocity ratio: {es_info.get('velocity_ratio', 0):.2f}")
+        context.append(f"Unique addresses 24h: {es_info.get('unique_addresses', 0)}")
+
+    if llama_info:
+        context.append(f"\nTVL: ${llama_info.get('tvl', 0):,.0f}")
+        context.append(f"TVL change 1d: {llama_info.get('tvl_change_1d', 0):.1f}%")
+
+    if massive_info:
+        context.append(f"\nMassive cross-exchange:")
+        context.append(f"  Price: ${massive_info.get('price', 0):,.4f}")
+        context.append(f"  24h change: {massive_info.get('change_24h', 0):.2f}%")
+        context.append(f"  24h volume: ${massive_info.get('volume_24h', 0):,.0f}")
+
+    context_str = "\n".join(context)
+
+    prompt = f"""You are a crypto hype quality analyst (Wintermute/Jump-style).
+Analyze this hype signal and determine if it's ORGANIC growth or PUMPED.
+
+{context_str}
+
+Reply with ONLY this JSON (no markdown, no code fences):
+
+{{
+  "quality": "ORGANIC OR PUMPED OR MIXED",
+  "risk": "low OR medium OR high OR extreme",
+  "recommendation_ar": "توصية قصيرة بالعربي (HOLD/SELL/AVOID + سبب)",
+  "reasoning_ar": "2-3 جمل بالعربي تشرح الجودة والمخاطر",
+  "confidence": "high OR medium OR low"
+}}
+
+Decision rules:
+- ORGANIC: balanced sources, real volume from many addresses, sustainable TVL growth
+- PUMPED: extreme spike with low whale count, vol/liquidity ratio > 5x normal
+- High risk if: low liquidity, single-source spike, suspicious patterns
+- AVOID: high risk + pumped signals
+- HOLD: organic + medium risk
+- BUY (carefully): organic + low risk + multiple sources confirm"""
+
+    url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 500}
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=(10, 25))
+    except Exception as e:
+        log.warning(f"[GEMINI] {sym}: {type(e).__name__}: {e}")
+        return None
+
+    if r.status_code != 200:
+        log.warning(f"[GEMINI] {sym}: HTTP {r.status_code}")
+        return None
+
+    try:
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError, ValueError):
+        return None
+
+    # Strip code fences
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+
+    if not parsed:
+        return None
+
+    return {
+        "quality":          str(parsed.get("quality", "MIXED")).upper(),
+        "risk":             str(parsed.get("risk", "medium")).lower(),
+        "recommendation_ar": parsed.get("recommendation_ar", ""),
+        "reasoning_ar":     parsed.get("reasoning_ar", ""),
+        "confidence":       str(parsed.get("confidence", "medium")).lower(),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 6.6 PORTFOLIO INTEGRATION (v4.0)
+# ══════════════════════════════════════════════════════════════════
+
+# ── v5.0: Claude — Wintermute-Style Strategist ──
+# Triggers on score ≥85. Provides scenario + risks + historical context.
+
+def claude_analyze_strategy(item: Dict[str, Any]) -> Optional[Dict]:
+    """
+    🟣 Claude — Wintermute-Style Strategist.
+    Deep reasoning: 24-48h scenario, risks, historical pattern matching.
+    Returns: {scenario_ar, risks_ar, historical_ar, target_pct, confidence}
+    """
+    if not CLAUDE_API_KEY:
+        return None
+
+    sym = item.get("symbol", "")
+    score = item.get("score", 0)
+    breakdown = item.get("breakdown", {})
+    ds_info = item.get("ds_info", {})
+    es_info = item.get("es_info", {})
+    llama_info = item.get("llama_info", {})
+    massive_info = item.get("massive_info", {})
+    gemini = item.get("ai", {})  # Gemini's quality verdict
+
+    # Build context
+    context_parts = [
+        f"Token: {sym}",
+        f"Hype Score: {score}/100",
+        f"Chain: {ds_info.get('chain', 'unknown')}",
+    ]
+
+    if ds_info:
+        context_parts.append(
+            f"DEX: vol_24h=${ds_info.get('volume_24h', 0):,.0f}, "
+            f"price_change_24h={ds_info.get('price_change_24h', 0):.1f}%, "
+            f"liquidity=${ds_info.get('liquidity', 0):,.0f}"
+        )
+    if es_info:
+        context_parts.append(
+            f"On-chain: whale_tx={es_info.get('whale_tx_count', 0)}, "
+            f"velocity={es_info.get('velocity_ratio', 0):.2f}x, "
+            f"unique_addrs={es_info.get('unique_addresses', 0)}"
+        )
+    if llama_info:
+        context_parts.append(
+            f"TVL: ${llama_info.get('tvl', 0):,.0f}, "
+            f"1d={llama_info.get('tvl_change_1d', 0):.1f}%, "
+            f"7d={llama_info.get('tvl_change_7d', 0):.1f}%"
+        )
+    if massive_info:
+        context_parts.append(
+            f"Cross-exchange: price=${massive_info.get('price', 0):,.4f}, "
+            f"24h={massive_info.get('change_24h', 0):.2f}%, "
+            f"vol=${massive_info.get('volume_24h', 0):,.0f}, "
+            f"24h_high=${massive_info.get('high_24h', 0):,.4f}, "
+            f"24h_low=${massive_info.get('low_24h', 0):,.4f}"
+        )
+    if gemini:
+        context_parts.append(
+            f"Gemini verdict: quality={gemini.get('quality', '?')}, "
+            f"risk={gemini.get('risk', '?')}"
+        )
+
+    context_str = "\n".join(context_parts)
+
+    prompt = f"""You are a senior crypto strategist at a quantitative fund (Wintermute/Jump style).
+Analyze this hype signal with DEEP reasoning. Focus on whale behavior, market structure, and historical patterns.
+
+{context_str}
+
+YOUR TASK: Provide strategic analysis. Reply with ONLY this JSON (no markdown, no code fences):
+
+{{
+  "scenario_ar": "السيناريو الأرجح خلال 24-48 ساعة (3-4 أسطر بالعربي مع نسب %)",
+  "risks_ar": "أهم 2-3 مخاطر يجب الحذر منها (بالعربي)",
+  "historical_ar": "سياق تاريخي: متى حدث pattern مشابه وما كانت النتيجة (سطر-سطرين بالعربي)",
+  "target_pct_24h": number (expected % move in 24h, e.g. 8.5 or -5.0),
+  "target_pct_48h": number (expected % move in 48h),
+  "key_resistance": number OR null (price level if data available),
+  "key_support": number OR null,
+  "confidence": "high OR medium OR low",
+  "agree_with_gemini": true OR false
+}}
+
+CRITICAL:
+- USE the cross-exchange prices above for resistance/support
+- Do NOT invent price levels — use 24h_high/low as anchors
+- Be specific. Reference whale behavior, velocity ratios, TVL flows."""
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+    }
+    body = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 800,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        r = requests.post(CLAUDE_BASE, headers=headers, json=body, timeout=(10, 35))
+    except Exception as e:
+        log.warning(f"[CLAUDE] {sym}: {type(e).__name__}: {e}")
+        return None
+
+    # Fallback to Sonnet if Opus fails
+    if r.status_code in (404, 400):
+        log.info(f"[CLAUDE] {CLAUDE_MODEL} unavailable, trying {CLAUDE_FALLBACK}")
+        body["model"] = CLAUDE_FALLBACK
+        try:
+            r = requests.post(CLAUDE_BASE, headers=headers, json=body, timeout=(10, 35))
+        except Exception as e:
+            log.warning(f"[CLAUDE] fallback failed: {e}")
+            return None
+
+    if r.status_code != 200:
+        log.warning(f"[CLAUDE] {sym}: HTTP {r.status_code}")
+        return None
+
+    try:
+        data = r.json()
+        content = data.get("content", [])
+        if not content:
+            return None
+        text = content[0].get("text", "").strip()
+    except (KeyError, IndexError, ValueError):
+        return None
+
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    text = text.strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+
+    if not parsed:
+        return None
+
+    return {
+        "scenario_ar":      parsed.get("scenario_ar", ""),
+        "risks_ar":         parsed.get("risks_ar", ""),
+        "historical_ar":    parsed.get("historical_ar", ""),
+        "target_pct_24h":   parsed.get("target_pct_24h"),
+        "target_pct_48h":   parsed.get("target_pct_48h"),
+        "key_resistance":   parsed.get("key_resistance"),
+        "key_support":      parsed.get("key_support"),
+        "confidence":       str(parsed.get("confidence", "medium")).lower(),
+        "agree_with_gemini": bool(parsed.get("agree_with_gemini", True)),
+    }
+
+
+# ── v5.0: OpenAI — Trade Execution Advisor ──
+# Triggers on score ≥92 (golden tier only). Provides specific entry/exit levels.
+
+def openai_analyze_execution(item: Dict[str, Any]) -> Optional[Dict]:
+    """
+    🔵 OpenAI GPT-4o — Trade Execution Advisor.
+    Specific actionable trade plan: entry, targets, stop loss, timing.
+    Returns: {entry, target1, target2, stop_loss, time_window_ar, conviction}
+    """
+    if not OPENAI_API_KEY:
+        return None
+
+    sym = item.get("symbol", "")
+    score = item.get("score", 0)
+    massive_info = item.get("massive_info", {})
+    ds_info = item.get("ds_info", {})
+    gemini = item.get("ai", {})
+    claude = item.get("claude", {})
+    portfolio = item.get("portfolio", {})
+
+    # Use cross-exchange price (most accurate)
+    current_price = (massive_info.get("price")
+                     or ds_info.get("price_usd") or 0)
+    high_24h = massive_info.get("high_24h", 0)
+    low_24h = massive_info.get("low_24h", 0)
+
+    if current_price <= 0:
+        return None
+
+    # Build context
+    context_parts = [
+        f"Token: {sym}",
+        f"Hype Score: {score}/100 (golden tier)",
+        f"Current Price: ${current_price:,.6f}".rstrip("0").rstrip("."),
+        f"24h High: ${high_24h:,.6f}".rstrip("0").rstrip("."),
+        f"24h Low: ${low_24h:,.6f}".rstrip("0").rstrip("."),
+    ]
+
+    if gemini:
+        context_parts.append(
+            f"Gemini quality: {gemini.get('quality', '?')} / "
+            f"risk={gemini.get('risk', '?')}"
+        )
+    if claude:
+        ctx_24h = claude.get("target_pct_24h")
+        ctx_res = claude.get("key_resistance")
+        ctx_sup = claude.get("key_support")
+        if ctx_24h is not None:
+            context_parts.append(f"Claude 24h target: {ctx_24h:.1f}%")
+        if ctx_res:
+            context_parts.append(f"Claude resistance: ${ctx_res}")
+        if ctx_sup:
+            context_parts.append(f"Claude support: ${ctx_sup}")
+
+    if portfolio:
+        avg_buy = portfolio.get("avg_buy_price", 0)
+        if avg_buy > 0:
+            context_parts.append(f"User holding at avg ${avg_buy:.6f}")
+
+    context_str = "\n".join(context_parts)
+
+    prompt = f"""You are a crypto trading desk executor (Jump Trading style).
+Give a SPECIFIC actionable trade plan for this golden hype signal.
+
+{context_str}
+
+YOUR TASK: Build a precise trade plan. Reply with ONLY this JSON:
+
+{{
+  "entry": number (recommended entry price),
+  "target_1": number (first take-profit, ~3-7% from entry),
+  "target_2": number (second take-profit, ~10-20% from entry),
+  "stop_loss": number (max loss point, below 24h low),
+  "position_size_ar": "حجم الصفقة الموصى به (مثل: '2-5% من المحفظة')",
+  "time_window_ar": "متى تنفذ ومتى تخرج (مثل: 'دخول الآن، خروج خلال 24-48h')",
+  "conviction": "high OR medium OR low",
+  "action_ar": "1-2 سطر توصية تنفيذية واضحة بالعربي"
+}}
+
+CRITICAL PRICE RULES:
+- ALL prices must be plain numbers (e.g. 76490.50 NOT "$76,490.50")
+- entry should be at or near current price (slight pullback ideal)
+- target_1 must be > entry, target_2 > target_1
+- stop_loss must be < entry (typically below 24h_low)
+- Use the actual 24h_high/low above as anchors
+- DO NOT invent levels outside the data provided
+- Be DECISIVE but never financial advice."""
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        r = requests.post(OPENAI_BASE, headers=headers, json=body, timeout=(10, 35))
+    except Exception as e:
+        log.warning(f"[OPENAI] {sym}: {type(e).__name__}: {e}")
+        return None
+
+    # Fallback to mini if main fails
+    if r.status_code in (404, 400):
+        log.info(f"[OPENAI] {OPENAI_MODEL} issue, trying {OPENAI_FALLBACK}")
+        body["model"] = OPENAI_FALLBACK
+        try:
+            r = requests.post(OPENAI_BASE, headers=headers, json=body, timeout=(10, 35))
+        except Exception as e:
+            log.warning(f"[OPENAI] fallback failed: {e}")
+            return None
+
+    if r.status_code != 200:
+        log.warning(f"[OPENAI] {sym}: HTTP {r.status_code}")
+        return None
+
+    try:
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, ValueError):
+        return None
+
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+
+    if not parsed:
+        return None
+
+    def _safe_float(v):
+        try:
+            return float(v) if v is not None and v != "null" else None
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "entry":           _safe_float(parsed.get("entry")),
+        "target_1":        _safe_float(parsed.get("target_1")),
+        "target_2":        _safe_float(parsed.get("target_2")),
+        "stop_loss":       _safe_float(parsed.get("stop_loss")),
+        "position_size_ar": parsed.get("position_size_ar", ""),
+        "time_window_ar":  parsed.get("time_window_ar", ""),
+        "conviction":      str(parsed.get("conviction", "medium")).lower(),
+        "action_ar":       parsed.get("action_ar", ""),
+    }
+
+
+# ── v5.0: AI Council Router ──
+# Tier-based escalation: more AIs as score increases.
+
+def determine_ai_tier(score: float) -> str:
+    """
+    Determines which AI tier to invoke based on score.
+    - tier_none:     score < 75   → no AI (basic alert)
+    - tier_quality:  75-84        → Gemini only (quality check)
+    - tier_strategy: 85-91        → Gemini + Claude (+ scenario)
+    - tier_council:  92+          → All 3 AIs (full council)
+    """
+    if score >= 92:
+        return "tier_council"
+    if score >= 85:
+        return "tier_strategy"
+    if score >= 75:
+        return "tier_quality"
+    return "tier_none"
+
+
+def run_ai_council(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run AI council based on score tier.
+    Modifies item in-place to add ai/claude/openai keys.
+    """
+    score = item.get("score", 0)
+    tier = determine_ai_tier(score)
+    sym = item.get("symbol", "?")
+
+    if tier == "tier_none":
+        return item
+
+    # Tier 1: Gemini (always for score ≥75)
+    if tier in ("tier_quality", "tier_strategy", "tier_council"):
+        try:
+            gemini_result = gemini_analyze_hype(item)
+            if gemini_result:
+                item["ai"] = gemini_result
+                log.info(f"[AI] {sym} Gemini: {gemini_result.get('quality')}/"
+                         f"{gemini_result.get('risk')}")
+        except Exception as e:
+            log.warning(f"[AI] {sym} Gemini failed: {e}")
+
+    # Tier 2: Claude (score ≥85)
+    if tier in ("tier_strategy", "tier_council"):
+        try:
+            claude_result = claude_analyze_strategy(item)
+            if claude_result:
+                item["claude"] = claude_result
+                log.info(f"[AI] {sym} Claude: target_24h="
+                         f"{claude_result.get('target_pct_24h')}%, "
+                         f"conf={claude_result.get('confidence')}")
+        except Exception as e:
+            log.warning(f"[AI] {sym} Claude failed: {e}")
+
+    # Tier 3: OpenAI (score ≥92 only — golden)
+    if tier == "tier_council":
+        try:
+            openai_result = openai_analyze_execution(item)
+            if openai_result:
+                item["openai"] = openai_result
+                log.info(f"[AI] {sym} OpenAI: entry={openai_result.get('entry')}, "
+                         f"conv={openai_result.get('conviction')}")
+        except Exception as e:
+            log.warning(f"[AI] {sym} OpenAI failed: {e}")
+
+    item["ai_tier"] = tier
+    return item
+
+
+def load_dca_portfolio() -> Optional[Dict]:
+    """Load latest portfolio from DCA_BOT shared volume."""
+    portfolio_file = os.path.join(DCA_DATA_DIR, "portfolio_latest.json")
+    if not os.path.exists(portfolio_file):
+        return None
+    try:
+        with open(portfolio_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.debug(f"[PORTFOLIO] load failed: {e}")
+        return None
+
+
+def get_portfolio_position(symbol: str) -> Optional[Dict]:
+    """Check if symbol is in user's DCA portfolio."""
+    portfolio = load_dca_portfolio()
+    if not portfolio:
+        return None
+    holdings = portfolio.get("holdings", [])
+    for h in holdings:
+        if h.get("symbol", "").upper() == symbol.upper():
+            return {
+                "amount":      h.get("amount", 0),
+                "avg_buy_price": h.get("avg_buy_price", 0),
+                "current_pnl_pct": h.get("pnl_pct", 0),
+                "exchange":    h.get("exchange", ""),
+            }
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1196,6 +2034,241 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
     else:
         lines.append("🎯 *تحليل وول ستريت:* إشارة عادية. retail-friendly.")
 
+    # ── v4.0: Massive cross-exchange data ──
+    massive_info = item.get("massive_info", {})
+    if massive_info and massive_info.get("price"):
+        price = massive_info.get("price", 0)
+        change = massive_info.get("change_24h", 0)
+        high = massive_info.get("high_24h", 0)
+        low = massive_info.get("low_24h", 0)
+        vol = massive_info.get("volume_24h", 0)
+
+        if price >= 100:
+            p_str, h_str, l_str = f"${price:,.2f}", f"${high:,.2f}", f"${low:,.2f}"
+        elif price >= 1:
+            p_str, h_str, l_str = f"${price:.4f}", f"${high:.4f}", f"${low:.4f}"
+        else:
+            p_str, h_str, l_str = f"${price:.6f}", f"${high:.6f}", f"${low:.6f}"
+
+        sign = "+" if change >= 0 else ""
+        arrow = "🟢" if change >= 0 else "🔴"
+        vol_m = vol / 1_000_000
+
+        lines.append("")
+        lines.append("💎 *Massive (Cross-Exchange):*")
+        lines.append(f"   السعر: `{p_str}` {arrow} {sign}{change:.2f}%")
+        lines.append(f"   24h: `{l_str}` ↔ `{h_str}`")
+        lines.append(f"   Volume: `${vol_m:.1f}M`")
+
+    # ── v5.0: Specialized AI Council (3 experts, tier-based) ──
+    ai = item.get("ai")
+    claude_data = item.get("claude")
+    openai_data = item.get("openai")
+    has_council = bool(ai or claude_data or openai_data)
+
+    def _fmt_price(val):
+        """Format price for display."""
+        if val is None or val == "null" or val == "":
+            return None
+        try:
+            num = float(val)
+            if num >= 100:
+                return f"${num:,.2f}"
+            elif num >= 1:
+                return f"${num:.4f}"
+            elif num > 0:
+                return f"${num:.6f}".rstrip("0").rstrip(".")
+            return None
+        except (ValueError, TypeError):
+            return None
+
+    if has_council:
+        lines.append("")
+        # Council header with tier badge
+        tier = item.get("ai_tier", "tier_quality")
+        if tier == "tier_council" or (claude_data and openai_data):
+            lines.append("🤝 *Council of AI Experts (3/3):*")
+        elif tier == "tier_strategy" or claude_data:
+            lines.append("🤝 *Council of AI Experts (2/3):*")
+        else:
+            lines.append("🤖 *AI Analysis:*")
+
+    # 🟢 Gemini — Quality Detector
+    if ai:
+        quality = ai.get("quality", "MIXED")
+        risk = ai.get("risk", "medium")
+        rec = ai.get("recommendation_ar", "")
+        reasoning = ai.get("reasoning_ar", "")
+
+        q_emoji = {"ORGANIC": "🟢", "PUMPED": "🔴", "MIXED": "🟡"}.get(quality, "⚪")
+        r_emoji = {"low": "🟢", "medium": "🟡", "high": "🟠", "extreme": "🔴"}.get(risk, "⚪")
+
+        lines.append("")
+        lines.append("🟢 *Gemini (Quality Detector):*")
+        lines.append(f"   {q_emoji} Quality: `{quality}`")
+        lines.append(f"   {r_emoji} Risk: `{risk}`")
+        if rec:
+            lines.append(f"   🎯 توصية: {rec}")
+        if reasoning:
+            lines.append(f"   💭 _{reasoning}_")
+
+    # 🟣 Claude — Wintermute Strategist
+    if claude_data:
+        scenario = claude_data.get("scenario_ar", "")
+        risks = claude_data.get("risks_ar", "")
+        historical = claude_data.get("historical_ar", "")
+        target_24h = claude_data.get("target_pct_24h")
+        target_48h = claude_data.get("target_pct_48h")
+        resistance = claude_data.get("key_resistance")
+        support = claude_data.get("key_support")
+        confidence = claude_data.get("confidence", "medium")
+        agree = claude_data.get("agree_with_gemini", True)
+
+        lines.append("")
+        lines.append("🟣 *Claude (Wintermute Strategist):*")
+
+        # Targets
+        target_lines = []
+        if target_24h is not None:
+            try:
+                t24 = float(target_24h)
+                sign = "+" if t24 >= 0 else ""
+                target_lines.append(f"24h: `{sign}{t24:.1f}%`")
+            except (ValueError, TypeError):
+                pass
+        if target_48h is not None:
+            try:
+                t48 = float(target_48h)
+                sign = "+" if t48 >= 0 else ""
+                target_lines.append(f"48h: `{sign}{t48:.1f}%`")
+            except (ValueError, TypeError):
+                pass
+        if target_lines:
+            lines.append(f"   📊 *Targets:* {' · '.join(target_lines)}")
+
+        if scenario:
+            lines.append(f"   🎯 *السيناريو:* {scenario}")
+
+        # Key levels
+        r_str = _fmt_price(resistance)
+        s_str = _fmt_price(support)
+        if r_str or s_str:
+            lvl_parts = []
+            if s_str:
+                lvl_parts.append(f"Support `{s_str}`")
+            if r_str:
+                lvl_parts.append(f"Resistance `{r_str}`")
+            lines.append(f"   📈 *مستويات:* {' ↔ '.join(lvl_parts)}")
+
+        if risks:
+            lines.append(f"   ⚠️ *المخاطر:* {risks}")
+        if historical:
+            lines.append(f"   📚 *سياق:* {historical}")
+
+        agree_str = "متفق مع Gemini" if agree else "*يخالف Gemini*"
+        lines.append(f"   🎚 ثقة: `{confidence}` · {agree_str}")
+
+    # 🔵 OpenAI — Trade Executor (golden tier only)
+    if openai_data:
+        entry = openai_data.get("entry")
+        target_1 = openai_data.get("target_1")
+        target_2 = openai_data.get("target_2")
+        stop_loss = openai_data.get("stop_loss")
+        position = openai_data.get("position_size_ar", "")
+        time_window = openai_data.get("time_window_ar", "")
+        conviction = openai_data.get("conviction", "medium")
+        action = openai_data.get("action_ar", "")
+
+        lines.append("")
+        lines.append("🔵 *GPT-4o (Trade Executor):*")
+
+        if action:
+            lines.append(f"   🎯 *توصية:* {action}")
+
+        # Trade plan
+        e_str = _fmt_price(entry)
+        t1_str = _fmt_price(target_1)
+        t2_str = _fmt_price(target_2)
+        sl_str = _fmt_price(stop_loss)
+
+        if e_str:
+            plan_lines = [f"Entry: `{e_str}`"]
+            if t1_str:
+                plan_lines.append(f"T1: `{t1_str}`")
+            if t2_str:
+                plan_lines.append(f"T2: `{t2_str}`")
+            if sl_str:
+                plan_lines.append(f"SL: `{sl_str}`")
+            lines.append(f"   📈 *الخطة:* {' · '.join(plan_lines)}")
+
+        # Calculate R/R if possible
+        try:
+            if entry and target_1 and stop_loss:
+                e_f = float(entry)
+                t1_f = float(target_1)
+                sl_f = float(stop_loss)
+                if e_f > sl_f:  # long
+                    reward = t1_f - e_f
+                    risk_amt = e_f - sl_f
+                    if risk_amt > 0:
+                        rr = reward / risk_amt
+                        lines.append(f"   ⚖️ *R/R:* `{rr:.2f}` (مكافأة/مخاطرة)")
+        except (ValueError, TypeError, ZeroDivisionError):
+            pass
+
+        if position:
+            lines.append(f"   💰 *حجم الصفقة:* {position}")
+        if time_window:
+            lines.append(f"   ⏰ *التوقيت:* {time_window}")
+
+        lines.append(f"   🎚 قناعة: `{conviction}`")
+
+    # ── Council Verdict (when 3 AIs present) ──
+    if ai and claude_data and openai_data:
+        gemini_quality = ai.get("quality", "MIXED")
+        claude_agrees = claude_data.get("agree_with_gemini", True)
+        claude_conf = claude_data.get("confidence", "medium")
+        openai_conv = openai_data.get("conviction", "medium")
+
+        lines.append("")
+        if (gemini_quality == "ORGANIC" and claude_agrees
+                and claude_conf == "high" and openai_conv == "high"):
+            verdict = "🎯 *إجماع 3/3 — قناعة عالية* ⭐"
+        elif gemini_quality == "PUMPED":
+            verdict = "🚨 *تحذير: Gemini يكشف PUMP — تجنّب!*"
+        elif claude_agrees:
+            verdict = "✅ *Claude متفق — إشارة قوية*"
+        else:
+            verdict = "⚠️ *Claude يخالف — تحقق إضافي مطلوب*"
+        lines.append(f"🤝 *Council Verdict:* {verdict}")
+
+    # ── v4.0: Portfolio Position (DCA integration) ──
+    portfolio = item.get("portfolio")
+    if portfolio:
+        amount = portfolio.get("amount", 0)
+        avg_buy = portfolio.get("avg_buy_price", 0)
+        pnl_pct = portfolio.get("current_pnl_pct", 0)
+        exchange = portfolio.get("exchange", "")
+
+        pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+        pnl_sign = "+" if pnl_pct >= 0 else ""
+
+        lines.append("")
+        lines.append("💼 *من محفظتك (DCA BOT):*")
+        if amount and amount > 0:
+            if amount >= 1:
+                lines.append(f"   🪙 الكمية: `{amount:.4f} {sym}`")
+            else:
+                lines.append(f"   🪙 الكمية: `{amount:.6f} {sym}`")
+        if avg_buy > 0:
+            if avg_buy >= 1:
+                lines.append(f"   💰 متوسط الشراء: `${avg_buy:.4f}`")
+            else:
+                lines.append(f"   💰 متوسط الشراء: `${avg_buy:.6f}`")
+        lines.append(f"   📊 PnL: {pnl_emoji} `{pnl_sign}{pnl_pct:.2f}%`")
+        if exchange:
+            lines.append(f"   🏦 Exchange: `{exchange}`")
+
     lines.append("")
     lines.append("⚠️ _تنفيذ يدوي — تعليمي فقط، ليس نصيحة مالية._")
 
@@ -1272,18 +2345,19 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
         # DexScreener FIRST (provides addresses for Etherscan)
         ds_data = await loop.run_in_executor(None, fetch_dexscreener_data)
 
-        # Then 4 in parallel (Etherscan needs DS data)
-        llama_task = loop.run_in_executor(None, fetch_defillama_data)
-        es_task    = loop.run_in_executor(None, fetch_etherscan_data, ds_data)
-        bin_task   = loop.run_in_executor(None, fetch_binance_data)
-        cp_task    = loop.run_in_executor(None, fetch_coinpaprika_data)
+        # Then 5 in parallel (Etherscan needs DS data, Massive is independent)
+        llama_task   = loop.run_in_executor(None, fetch_defillama_data)
+        es_task      = loop.run_in_executor(None, fetch_etherscan_data, ds_data)
+        bin_task     = loop.run_in_executor(None, fetch_binance_data)
+        cp_task      = loop.run_in_executor(None, fetch_coinpaprika_data)
+        massive_task = loop.run_in_executor(None, fetch_massive_data)
 
-        llama_data, es_data, bin_data, cp_data = await asyncio.gather(
-            llama_task, es_task, bin_task, cp_task
+        llama_data, es_data, bin_data, cp_data, massive_data = await asyncio.gather(
+            llama_task, es_task, bin_task, cp_task, massive_task
         )
 
         aggregated = aggregate_hype_signals(
-            ds_data, llama_data, es_data, bin_data, cp_data
+            ds_data, llama_data, es_data, bin_data, cp_data, massive_data
         )
 
         global last_results
@@ -1299,6 +2373,24 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
 
             if is_in_cooldown(sym):
                 continue
+
+            # ── v5.0: Run AI Council (tier-based escalation) ──
+            # tier_quality (≥75): Gemini
+            # tier_strategy (≥85): + Claude
+            # tier_council (≥92):  + OpenAI
+            try:
+                item = await loop.run_in_executor(None, run_ai_council, item)
+            except Exception as e:
+                log.warning(f"[COUNCIL] {sym}: {e}")
+
+            # ── v4.0: Enrich with portfolio data ──
+            try:
+                portfolio_pos = get_portfolio_position(sym)
+                if portfolio_pos:
+                    item["portfolio"] = portfolio_pos
+                    log.info(f"[PORTFOLIO] {sym} found in user holdings")
+            except Exception as e:
+                log.debug(f"[PORTFOLIO] {sym}: {e}")
 
             try:
                 msg = format_alert(item, mode)
@@ -1335,32 +2427,39 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    es_status = ("✅ مفعّل (5 مصادر للـ EVM)"
-                 if ETHERSCAN_KEY else "⚪ معطّل (لا يوجد مفتاح)")
+    es_status = ("✅" if ETHERSCAN_KEY else "⚪")
+    massive_status = ("✅" if POLYGON_API_KEY else "⚪")
+    gem_status = ("✅" if GEMINI_API_KEY else "⚪")
+    cl_status = ("✅" if CLAUDE_API_KEY else "⚪")
+    oa_status = ("✅" if OPENAI_API_KEY else "⚪")
 
     msg = (
-        "🔥 *HYPE_BOT v3.0* — Wintermute-Style Scanner\n\n"
-        "كاشف الهايب من 5 مصادر مدمجة بأوزان احترافية ديناميكية.\n"
+        "🔥 *HYPE_BOT v5.0* — Specialized AI Council\n\n"
+        "كاشف الهايب احترافي بـ 6 مصادر + 3 AI خبراء.\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "*المصادر والأوزان (chain-aware):*\n"
-        "💧 DexScreener    `35%`  on-chain DEX volume\n"
-        "🦙 DefiLlama      `20%`  TVL change\n"
-        f"🔍 Etherscan      `20%`  on-chain whale activity\n"
-        f"     {es_status}\n"
-        "🐋 Binance Fut.   `15%`  OI + price\n"
-        "📊 CoinPaprika    `10%`  retail trending\n\n"
-        "*ميزة Chain-Aware:*\n"
-        "للعملات EVM (ETH/BSC/Polygon/Arbitrum/Base/...): 5 مصادر\n"
-        "للعملات غير EVM (Solana/...): 4 مصادر (وزن Etherscan يُعاد توزيعه)\n\n"
-        "*أوضاع الكشف:*\n"
-        "🟢 `هايب`          ≥65  عادي\n"
-        "⚖️ `هايب متوازن`    ≥75  watchlist\n"
-        "💎 `هايب جودة`      ≥85  دخول المحترفين\n"
-        "👑 `هايب ذهبي`      ≥92  قنّاصة (نادر)\n\n"
-        "*أوامر إضافية:*\n"
-        "`/test`        فحص اتصال المصادر\n"
+        "*المصادر (6) — chain-aware:*\n"
+        "💧 DexScreener    `30%`  on-chain DEX volume\n"
+        "🦙 DefiLlama      `18%`  TVL change\n"
+        f"🔍 Etherscan      `18%`  whale activity {es_status}\n"
+        "🐋 Binance Fut.   `12%`  OI + futures\n"
+        "📊 CoinPaprika    `7%`   retail trending\n"
+        f"💎 Massive        `15%`  cross-exchange {massive_status}\n\n"
+        "*🤝 AI Council (specialized roles):*\n"
+        f"🟢 Gemini   {gem_status}  Quality Detector (≥75)\n"
+        f"🟣 Claude   {cl_status}  Wintermute Strategist (≥85)\n"
+        f"🔵 GPT-4o   {oa_status}  Trade Executor (≥92)\n\n"
+        "💼 *Portfolio:* DCA integration\n\n"
+        "*أوضاع الكشف (tier-based AI):*\n"
+        "🟢 `هايب`          ≥65  Sources only\n"
+        "⚖️ `هايب متوازن`    ≥75  + Gemini\n"
+        "💎 `هايب جودة`      ≥85  + Claude\n"
+        "👑 `هايب ذهبي`      ≥92  + GPT-4o (Council كامل)\n\n"
+        "*الأوامر:*\n"
+        "`/test`        فحص شامل (6 + AI Council)\n"
+        "`/scan SYMBOL` فحص يدوي لعملة + AI ⭐\n"
+        "`/movers`      Top gainers cross-exchange ⭐\n"
         "`/esdebug`     تشخيص Etherscan\n"
-        "`حالة`         حالة المصادر الـ5\n"
+        "`حالة`         حالة المصادر\n"
         "`نتائج`        آخر 10 إشارات\n"
         "`top10`        أعلى 10 عملات هايب\n"
         "`سجل`          سجل التنبيهات\n"
@@ -1402,13 +2501,47 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     lines.append(line("Binance",     "binance",     "زوج USDT"))
     lines.append(line("CoinPaprika", "coinpaprika", "عملة"))
 
-    active_count = sum(1 for v in s.values() if v.get("ok"))
-    expected = 5 if ETHERSCAN_KEY else 4
+    # v4.0: Massive (cross-exchange)
+    if POLYGON_API_KEY:
+        lines.append(line("Massive", "massive", "ticker"))
+    else:
+        lines.append("⚪ *Massive*: معطّل (لا يوجد POLYGON_API_KEY)")
+
+    # v5.0: AI Council status
     lines.append("")
-    if active_count >= expected - 1:
-        lines.append(f"🎯 *الحالة:* ممتازة ({active_count}/5 — متوقع {expected})")
+    lines.append("*🤝 AI Council (Specialized):*")
+    if GEMINI_API_KEY:
+        lines.append("🟢 Gemini (Quality): ✅ مفعّل · score ≥75")
+    else:
+        lines.append("🟢 Gemini (Quality): ⚪ معطّل (GEMINI_API_KEY)")
+    if CLAUDE_API_KEY:
+        lines.append("🟣 Claude (Strategy): ✅ مفعّل · score ≥85")
+    else:
+        lines.append("🟣 Claude (Strategy): ⚪ معطّل (CLAUDE_API_KEY)")
+    if OPENAI_API_KEY:
+        lines.append("🔵 OpenAI (Executor): ✅ مفعّل · score ≥92")
+    else:
+        lines.append("🔵 OpenAI (Executor): ⚪ معطّل (OPENAI_API_KEY)")
+
+    # v4.0: Portfolio status
+    lines.append("")
+    portfolio = load_dca_portfolio()
+    if portfolio:
+        n_holdings = len(portfolio.get("holdings", []))
+        lines.append(f"💼 *Portfolio (DCA):* ✅ {n_holdings} عملة")
+    else:
+        lines.append("💼 *Portfolio (DCA):* ⚪ غير متصل")
+
+    active_count = sum(1 for v in s.values() if v.get("ok"))
+    expected = 6 if (ETHERSCAN_KEY and POLYGON_API_KEY) else (5 if ETHERSCAN_KEY else 4)
+    ai_count = sum(1 for k in [GEMINI_API_KEY, CLAUDE_API_KEY, OPENAI_API_KEY] if k)
+    lines.append("")
+    if active_count >= expected - 1 and ai_count == 3:
+        lines.append(f"🎯 *الحالة:* ممتازة ({active_count}/6 + Council 3/3) ⭐")
+    elif active_count >= expected - 1:
+        lines.append(f"✅ *الحالة:* جيدة ({active_count}/6 + AI {ai_count}/3)")
     elif active_count >= expected // 2:
-        lines.append(f"⚠️ *الحالة:* مقبولة ({active_count}/5)")
+        lines.append(f"⚠️ *الحالة:* مقبولة ({active_count}/6)")
     else:
         lines.append(f"🚨 *الحالة:* ضعيفة ({active_count}/5)")
 
@@ -1516,6 +2649,219 @@ async def cmd_esdebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     await msg.delete()
     await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_scan(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """v4.0: Manual scan for a specific coin → full analysis with all 6 sources + AI."""
+    args = c.args
+    if not args:
+        await u.message.reply_text(
+            "*Usage:* `/scan SYMBOL`\n\n"
+            "أمثلة:\n"
+            "`/scan BTC`\n"
+            "`/scan HYPE`\n"
+            "`/scan RENDER`\n\n"
+            "_فحص شامل بـ 6 مصادر + AI + portfolio_",
+            parse_mode="Markdown"
+        )
+        return
+
+    sym = args[0].upper()
+    msg = await u.message.reply_text(
+        f"⏳ *فحص شامل لـ {sym}...*\n"
+        "💧 DexScreener → 🦙 DefiLlama → 🐋 Binance\n"
+        "📊 CoinPaprika → 💎 Massive → 🤖 AI",
+        parse_mode="Markdown"
+    )
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Fetch all 6 sources in parallel
+        ds_data      = await loop.run_in_executor(None, fetch_dexscreener_data)
+        llama_task   = loop.run_in_executor(None, fetch_defillama_data)
+        es_task      = loop.run_in_executor(None, fetch_etherscan_data, ds_data)
+        bin_task     = loop.run_in_executor(None, fetch_binance_data)
+        cp_task      = loop.run_in_executor(None, fetch_coinpaprika_data)
+        massive_task = loop.run_in_executor(None, fetch_massive_data)
+
+        llama_data, es_data, bin_data, cp_data, massive_data = await asyncio.gather(
+            llama_task, es_task, bin_task, cp_task, massive_task
+        )
+
+        aggregated = aggregate_hype_signals(
+            ds_data, llama_data, es_data, bin_data, cp_data, massive_data
+        )
+
+        # Find the requested symbol
+        target = None
+        for item in aggregated:
+            if item["symbol"] == sym:
+                target = item
+                break
+
+        if not target:
+            await msg.delete()
+            await u.message.reply_text(
+                f"❌ *لا توجد بيانات كافية لـ {sym}*\n\n"
+                f"الأسباب المحتملة:\n"
+                f"• العملة غير موجودة في أي مصدر\n"
+                f"• Score أقل من 30 (لا يستحق التتبع)\n"
+                f"• الرمز غير صحيح",
+                parse_mode="Markdown"
+            )
+            return
+
+        # ── v5.0: Run AI Council with progress updates ──
+        score = target.get("score", 0)
+        tier = determine_ai_tier(score)
+
+        # For manual /scan, force at least Gemini analysis (even if score <75)
+        # so user always gets an AI verdict on demand
+        if score < 75 and GEMINI_API_KEY:
+            try:
+                await msg.edit_text(
+                    f"⏳ *فحص شامل لـ {sym}* (score={score})\n"
+                    "🟢 Gemini يحلّل الجودة...",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            try:
+                gem = await loop.run_in_executor(None, gemini_analyze_hype, target)
+                if gem:
+                    target["ai"] = gem
+                    target["ai_tier"] = "tier_quality_manual"
+            except Exception as e:
+                log.warning(f"[SCAN-AI] Gemini {sym}: {e}")
+
+        elif tier == "tier_quality":
+            try:
+                await msg.edit_text(
+                    f"⏳ *فحص شامل لـ {sym}*\n"
+                    "🟢 Gemini يحلّل الجودة...",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            target = await loop.run_in_executor(None, run_ai_council, target)
+
+        elif tier == "tier_strategy":
+            try:
+                await msg.edit_text(
+                    f"⏳ *فحص شامل لـ {sym}*\n"
+                    "🟢 Gemini → 🟣 Claude يحلل...",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            target = await loop.run_in_executor(None, run_ai_council, target)
+
+        elif tier == "tier_council":
+            try:
+                await msg.edit_text(
+                    f"⏳ *فحص شامل لـ {sym}* 👑\n"
+                    "🟢 Gemini → 🟣 Claude → 🔵 GPT-4o\n"
+                    "_قد يستغرق 15-30 ثانية_",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            target = await loop.run_in_executor(None, run_ai_council, target)
+
+        # Add portfolio info
+        portfolio_pos = get_portfolio_position(sym)
+        if portfolio_pos:
+            target["portfolio"] = portfolio_pos
+
+        # Format and send
+        formatted = format_alert(target, "manual")
+        buttons = build_alert_buttons(target)
+
+        await msg.delete()
+        await u.message.reply_text(
+            formatted,
+            parse_mode="Markdown",
+            reply_markup=buttons,
+            disable_web_page_preview=True,
+        )
+
+    except Exception as e:
+        log.exception(f"[SCAN] {sym}: {e}")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await u.message.reply_text(
+            f"⚠️ *خطأ في الفحص:* `{str(e)[:80]}`",
+            parse_mode="Markdown"
+        )
+
+
+async def cmd_movers(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """v4.0: Show top crypto gainers from Massive."""
+    if not POLYGON_API_KEY:
+        await u.message.reply_text(
+            "⚠️ *Massive غير مفعّل*\n\n"
+            "أضف `POLYGON_API_KEY` في Railway لتفعيل هذه الميزة.",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = await u.message.reply_text("⏳ جاري جلب Top Movers...")
+
+    try:
+        loop = asyncio.get_event_loop()
+        movers = await loop.run_in_executor(None, massive_get_top_movers, 10)
+
+        if not movers:
+            await msg.delete()
+            await u.message.reply_text(
+                "⚠️ *لا توجد بيانات حالياً*\n\nحاول مرة أخرى بعد دقيقة.",
+                parse_mode="Markdown"
+            )
+            return
+
+        lines = ["📈 *Top Crypto Gainers*",
+                 f"🕐 {now_iso()[:16].replace('T', ' ')}",
+                 "💎 _Massive cross-exchange data_",
+                 "━━━━━━━━━━━━━━━━━━━━",
+                 ""]
+
+        for i, m in enumerate(movers, 1):
+            sym = m["symbol"]
+            change = m["change_pct"]
+            price = m["price"]
+
+            if price >= 100:
+                p_str = f"${price:,.2f}"
+            elif price >= 1:
+                p_str = f"${price:.4f}"
+            else:
+                p_str = f"${price:.6f}"
+
+            sign = "+" if change >= 0 else ""
+            arrow = "🟢" if change >= 0 else "🔴"
+            lines.append(f"{i}. *{sym}* — `{p_str}` {arrow} `{sign}{change:.2f}%`")
+
+        lines.append("")
+        lines.append("💡 _استخدم `/scan SYMBOL` للتحليل الكامل_")
+
+        await msg.delete()
+        await u.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+
+    except Exception as e:
+        log.exception(f"[MOVERS] {e}")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await u.message.reply_text(f"⚠️ خطأ: `{str(e)[:80]}`",
+                                   parse_mode="Markdown")
 
 
 async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1716,18 +3062,30 @@ async def _post_init(app):
 
 
 def _print_banner():
-    es_status = ("✅ مفعّل (chain-aware)"
-                 if ETHERSCAN_KEY else "⚪ معطّل (لا يوجد مفتاح)")
+    es_status = "✅" if ETHERSCAN_KEY else "⚪"
+    massive_status = "✅" if POLYGON_API_KEY else "⚪"
+    gem_status = "✅" if GEMINI_API_KEY else "⚪"
+    cl_status = "✅" if CLAUDE_API_KEY else "⚪"
+    oa_status = "✅" if OPENAI_API_KEY else "⚪"
+    portfolio_status = ("✅" if os.path.exists(
+        os.path.join(DCA_DATA_DIR, "portfolio_latest.json")) else "⚪")
 
     print("=" * 70)
-    print("  🔥 HYPE_BOT v3.0 — Wintermute-Style Scanner ✅")
+    print("  🔥 HYPE_BOT v5.0 — Specialized AI Council ✅")
     print("=" * 70)
-    print(f"  المعمارية      : 5 مصادر (chain-aware dynamic weights)")
-    print(f"    💧 DexScreener  : ✅ مجاني (35% EVM / 45% non-EVM)")
-    print(f"    🦙 DefiLlama    : ✅ مجاني (20% EVM / 25% non-EVM)")
-    print(f"    🔍 Etherscan V2 : {es_status}  (20% EVM / 0% non-EVM)")
-    print(f"    🐋 Binance Fut. : ✅ مجاني (15% EVM / 18% non-EVM)")
-    print(f"    📊 CoinPaprika  : ✅ مجاني (10% EVM / 12% non-EVM)")
+    print(f"  المصادر (6) — chain-aware:")
+    print(f"    💧 DexScreener  : ✅ (30% EVM / 40% non-EVM)")
+    print(f"    🦙 DefiLlama    : ✅ (18% EVM / 22% non-EVM)")
+    print(f"    🔍 Etherscan V2 : {es_status} (18% EVM / 0% non-EVM)")
+    print(f"    🐋 Binance Fut. : ✅ (12% EVM / 15% non-EVM)")
+    print(f"    📊 CoinPaprika  : ✅ (7%  EVM / 8%  non-EVM)")
+    print(f"    💎 Massive      : {massive_status} (15% all chains)")
+    print(f"  🤝 AI Council (specialized):")
+    print(f"    🟢 Gemini       : {gem_status} Quality Detector  (score ≥75)")
+    print(f"    🟣 Claude       : {cl_status} Wintermute Strategist (score ≥85)")
+    print(f"    🔵 GPT-4o       : {oa_status} Trade Executor    (score ≥92)")
+    print(f"  Portfolio:")
+    print(f"    💼 DCA link     : {portfolio_status}  ({DCA_DATA_DIR}/portfolio_latest.json)")
     print(f"  EVM chains      : ETH, BSC, Polygon, Arbitrum, Optimism,")
     print(f"                    Base, Avalanche, Fantom, Linea, Blast")
     print(f"  الأوضاع         : 4 (65 / 75 / 85 / 92)")
@@ -1757,6 +3115,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("esdebug", cmd_esdebug))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("movers", cmd_movers))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_msg
     ))
