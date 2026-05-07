@@ -152,16 +152,16 @@ def get_weights_for_chain(chain: str) -> Dict[str, float]:
 
 
 MODES = {
-    "عادي":    {"min": 65, "min_sources": 2, "label": "🟢 عادي",   "min_per_source": 0},
-    "متوازن":  {"min": 75, "min_sources": 3, "label": "⚖️ متوازن", "min_per_source": 50},
-    "جودة":    {"min": 85, "min_sources": 3, "label": "💎 جودة",   "min_per_source": 60},
-    "ذهبي":    {"min": 92, "min_sources": 4, "label": "👑 ذهبي",   "min_per_source": 70},
+    "عادي":    {"min": 55, "min_sources": 2, "label": "🟢 عادي",   "min_per_source": 0},
+    "متوازن":  {"min": 70, "min_sources": 3, "label": "⚖️ متوازن", "min_per_source": 40},
+    "جودة":    {"min": 80, "min_sources": 3, "label": "💎 جودة",   "min_per_source": 55},
+    "ذهبي":    {"min": 90, "min_sources": 4, "label": "👑 ذهبي",   "min_per_source": 65},
 }
 
 SCAN_INTERVAL_SEC = 300
 COOLDOWN_HOURS    = 1
 MAX_RESULTS_KEPT  = 50
-MIN_LIQUIDITY_USD = 100_000
+MIN_LIQUIDITY_USD = 50_000   # was 100K, lowered for emerging tokens
 MIN_BINANCE_VOL   = 500_000
 
 ES_TX_OFFSET     = 1000
@@ -276,14 +276,14 @@ def fetch_dexscreener_data() -> Dict[str, Dict]:
 
     addresses = []
     if isinstance(boosts, list):
-        for b in boosts[:30]:
+        for b in boosts[:50]:  # was 30, now 50 for better coverage
             addr = b.get("tokenAddress")
             chain = b.get("chainId")
             if addr and chain:
                 addresses.append((chain, addr, b.get("totalAmount", 0)))
 
     out = {}
-    for chain, addr, boost_amount in addresses[:25]:
+    for chain, addr, boost_amount in addresses[:40]:  # was 25, now 40
         pair_data = safe_get(f"{DS_BASE}/latest/dex/tokens/{addr}", retries=1)
         if not pair_data or "pairs" not in pair_data:
             continue
@@ -1386,7 +1386,7 @@ Decision rules:
 # ══════════════════════════════════════════════════════════════════
 
 # ── v5.0: Claude — Wintermute-Style Strategist ──
-# Triggers on score ≥85. Provides scenario + risks + historical context.
+# Triggers on score ≥80. Provides scenario + risks + historical context.
 
 def claude_analyze_strategy(item: Dict[str, Any]) -> Optional[Dict]:
     """
@@ -1543,7 +1543,7 @@ CRITICAL:
 
 
 # ── v5.0: OpenAI — Trade Execution Advisor ──
-# Triggers on score ≥92 (golden tier only). Provides specific entry/exit levels.
+# Triggers on score ≥90 (golden tier only). Provides specific entry/exit levels.
 
 def openai_analyze_execution(item: Dict[str, Any]) -> Optional[Dict]:
     """
@@ -1709,16 +1709,16 @@ CRITICAL PRICE RULES:
 def determine_ai_tier(score: float) -> str:
     """
     Determines which AI tier to invoke based on score.
-    - tier_none:     score < 75   → no AI (basic alert)
-    - tier_quality:  75-84        → Gemini only (quality check)
-    - tier_strategy: 85-91        → Gemini + Claude (+ scenario)
-    - tier_council:  92+          → All 3 AIs (full council)
+    - tier_none:     score < 70   → no AI (basic alert)
+    - tier_quality:  70-79        → Gemini only (quality check)
+    - tier_strategy: 80-89        → Gemini + Claude (+ scenario)
+    - tier_council:  90+          → All 3 AIs (full council)
     """
-    if score >= 92:
+    if score >= 90:
         return "tier_council"
-    if score >= 85:
+    if score >= 80:
         return "tier_strategy"
-    if score >= 75:
+    if score >= 70:
         return "tier_quality"
     return "tier_none"
 
@@ -1735,7 +1735,7 @@ def run_ai_council(item: Dict[str, Any]) -> Dict[str, Any]:
     if tier == "tier_none":
         return item
 
-    # Tier 1: Gemini (always for score ≥75)
+    # Tier 1: Gemini (always for score ≥70)
     if tier in ("tier_quality", "tier_strategy", "tier_council"):
         try:
             gemini_result = gemini_analyze_hype(item)
@@ -1746,7 +1746,7 @@ def run_ai_council(item: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.warning(f"[AI] {sym} Gemini failed: {e}")
 
-    # Tier 2: Claude (score ≥85)
+    # Tier 2: Claude (score ≥80)
     if tier in ("tier_strategy", "tier_council"):
         try:
             claude_result = claude_analyze_strategy(item)
@@ -1758,7 +1758,7 @@ def run_ai_council(item: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.warning(f"[AI] {sym} Claude failed: {e}")
 
-    # Tier 3: OpenAI (score ≥92 only — golden)
+    # Tier 3: OpenAI (score ≥90 only — golden)
     if tier == "tier_council":
         try:
             openai_result = openai_analyze_execution(item)
@@ -1850,10 +1850,10 @@ def mark_seen(symbol: str):
 # ══════════════════════════════════════════════════════════════════
 
 def _grade_label(score: float) -> str:
-    if score >= 92:  return "👑 *ذهبي* (نادر)"
-    if score >= 85:  return "💎 *جودة*"
-    if score >= 75:  return "⚖️ *متوازن*"
-    if score >= 65:  return "🟢 *عادي*"
+    if score >= 90:  return "👑 *ذهبي* (نادر)"
+    if score >= 80:  return "💎 *جودة*"
+    if score >= 70:  return "⚖️ *متوازن*"
+    if score >= 55:  return "🟢 *عادي*"
     return "⚪ ضعيف"
 
 
@@ -2020,16 +2020,16 @@ def format_alert(item: Dict[str, Any], mode: str) -> str:
     lines.append("")
 
     # Wall street insight
-    if score >= 92:
+    if score >= 90:
         if is_evm and bk["etherscan"] >= 80:
             lines.append("🎯 *تحليل وول ستريت:* on-chain whale activity ممتازة + إجماع مصادر "
                         "= نمط Wintermute. دخول الحيتان مؤكّد. تحقّق يدوي قبل الدخول.")
         else:
             lines.append("🎯 *تحليل وول ستريت:* 4+ مصادر متفقة بقوة. صفقة قنّاصة. "
                         "تحقّق يدوي قبل الدخول.")
-    elif score >= 85:
+    elif score >= 80:
         lines.append("🎯 *تحليل وول ستريت:* منطقة دخول الحيتان. on-chain volume يدعم.")
-    elif score >= 75:
+    elif score >= 70:
         lines.append("🎯 *تحليل وول ستريت:* watchlist للمتداولين الكبار — مراقبة لا دخول.")
     else:
         lines.append("🎯 *تحليل وول ستريت:* إشارة عادية. retail-friendly.")
@@ -2450,10 +2450,10 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"🔵 GPT-4o   {oa_status}  Trade Executor (≥92)\n\n"
         "💼 *Portfolio:* DCA integration\n\n"
         "*أوضاع الكشف (tier-based AI):*\n"
-        "🟢 `هايب`          ≥65  Sources only\n"
-        "⚖️ `هايب متوازن`    ≥75  + Gemini\n"
-        "💎 `هايب جودة`      ≥85  + Claude\n"
-        "👑 `هايب ذهبي`      ≥92  + GPT-4o (Council كامل)\n\n"
+        "🟢 `هايب`          ≥55  Sources only\n"
+        "⚖️ `هايب متوازن`    ≥70  + Gemini\n"
+        "💎 `هايب جودة`      ≥80  + Claude\n"
+        "👑 `هايب ذهبي`      ≥90  + GPT-4o (Council كامل)\n\n"
         "*الأوامر:*\n"
         "`/test`        فحص شامل (6 + AI Council)\n"
         "`/scan SYMBOL` فحص يدوي لعملة + AI ⭐\n"
@@ -2512,17 +2512,17 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     lines.append("*🤝 AI Council (Specialized):*")
     if GEMINI_API_KEY:
         key_len = len(GEMINI_API_KEY)
-        lines.append(f"🟢 Gemini (Quality): ✅ مفعّل · score ≥75 · `{key_len} chars`")
+        lines.append(f"🟢 Gemini (Quality): ✅ مفعّل · score ≥70 · `{key_len} chars`")
     else:
         lines.append("🟢 Gemini (Quality): ⚪ معطّل (`GEMINI_API_KEY` فاضي)")
     if CLAUDE_API_KEY:
         key_len = len(CLAUDE_API_KEY)
-        lines.append(f"🟣 Claude (Strategy): ✅ مفعّل · score ≥85 · `{key_len} chars`")
+        lines.append(f"🟣 Claude (Strategy): ✅ مفعّل · score ≥80 · `{key_len} chars`")
     else:
         lines.append("🟣 Claude (Strategy): ⚪ معطّل (`CLAUDE_API_KEY` فاضي)")
     if OPENAI_API_KEY:
         key_len = len(OPENAI_API_KEY)
-        lines.append(f"🔵 OpenAI (Executor): ✅ مفعّل · score ≥92 · `{key_len} chars`")
+        lines.append(f"🔵 OpenAI (Executor): ✅ مفعّل · score ≥90 · `{key_len} chars`")
     else:
         lines.append("🔵 OpenAI (Executor): ⚪ معطّل (`OPENAI_API_KEY` فاضي)")
 
@@ -3216,14 +3216,14 @@ def _print_banner():
     print(f"    📊 CoinPaprika  : ✅ (7%  EVM / 8%  non-EVM)")
     print(f"    💎 Massive      : {massive_status} (15% all chains)")
     print(f"  🤝 AI Council (specialized):")
-    print(f"    🟢 Gemini       : {gem_status} Quality Detector  (score ≥75)")
-    print(f"    🟣 Claude       : {cl_status} Wintermute Strategist (score ≥85)")
-    print(f"    🔵 GPT-4o       : {oa_status} Trade Executor    (score ≥92)")
+    print(f"    🟢 Gemini       : {gem_status} Quality Detector  (score ≥70)")
+    print(f"    🟣 Claude       : {cl_status} Wintermute Strategist (score ≥80)")
+    print(f"    🔵 GPT-4o       : {oa_status} Trade Executor    (score ≥90)")
     print(f"  Portfolio:")
     print(f"    💼 DCA link     : {portfolio_status}  ({DCA_DATA_DIR}/portfolio_latest.json)")
     print(f"  EVM chains      : ETH, BSC, Polygon, Arbitrum, Optimism,")
     print(f"                    Base, Avalanche, Fantom, Linea, Blast")
-    print(f"  الأوضاع         : 4 (65 / 75 / 85 / 92)")
+    print(f"  الأوضاع         : 4 (55 / 70 / 80 / 90)")
     print(f"  المسح           : كل {SCAN_INTERVAL_SEC // 60} دقائق")
     print(f"  Cooldown        : ساعة لكل عملة")
     print(f"  Min Liquidity   : ${MIN_LIQUIDITY_USD:,}")
